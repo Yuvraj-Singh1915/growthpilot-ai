@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from openai import OpenAI
 import json
 import os
@@ -22,6 +22,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
     inspect,
+    text,
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.exc import IntegrityError
@@ -41,6 +42,11 @@ from services.experiment_engine import (
 )
 from services.measurement_engine import calculate_experiment_metrics
 from services.learning_engine import build_learning_evidence
+from services.razorpay_webhook import (
+    normalize_razorpay_event,
+    payload_sha256,
+    verify_razorpay_signature,
+)
 
 DATABASE_URL = os.getenv("GROWTHPILOT_DATABASE_URL", "sqlite:///./growthpilot.db")
 
@@ -100,6 +106,8 @@ class Order(Base):
     status = Column(String, nullable=False)
     margin_percent = Column(Float, nullable=True)
     external_order_id = Column(String, nullable=True)
+    provider = Column(String, nullable=True)
+    provider_account = Column(String, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
@@ -115,12 +123,47 @@ class CartEvent(Base):
 
 class Payment(Base):
     __tablename__ = "commerce_payments"
+    __table_args__ = (
+        Index(
+            "uq_commerce_payments_provider_external_id",
+            "provider",
+            "provider_account",
+            "external_payment_id",
+            unique=True,
+            sqlite_where=text("external_payment_id IS NOT NULL"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     order_id = Column(Integer, ForeignKey("commerce_orders.id"), nullable=False)
     status = Column(String, nullable=False)
     amount = Column(Float, nullable=False)
+    provider = Column(String, nullable=True)
+    provider_account = Column(String, nullable=True)
+    external_payment_id = Column(String, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class WebhookEvent(Base):
+    __tablename__ = "webhook_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "provider_account",
+            "event_id",
+            name="uq_webhook_events_provider_account_event",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    provider = Column(String, nullable=False)
+    provider_account = Column(String, nullable=False)
+    event_id = Column(String, nullable=False)
+    event_type = Column(String, nullable=False)
+    event_timestamp = Column(DateTime, nullable=True)
+    received_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    processing_status = Column(String, nullable=False)
+    payload_hash = Column(String, nullable=False)
 
 
 class Experiment(Base):
@@ -275,7 +318,16 @@ migrate_opportunity_columns()
 
 def migrate_learning_loop_columns():
     additive_columns = {
-        "commerce_orders": {"external_order_id": "TEXT"},
+        "commerce_orders": {
+            "external_order_id": "TEXT",
+            "provider": "TEXT",
+            "provider_account": "TEXT",
+        },
+        "commerce_payments": {
+            "provider": "TEXT",
+            "provider_account": "TEXT",
+            "external_payment_id": "TEXT",
+        },
         "experiments": {
             "original_strategy_action": "TEXT",
             "strategy_code": "VARCHAR",
@@ -313,6 +365,12 @@ def migrate_learning_loop_columns():
             "uq_commerce_orders_external_order_id "
             "ON commerce_orders (external_order_id) "
             "WHERE external_order_id IS NOT NULL"
+        )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_commerce_payments_provider_external_id "
+            "ON commerce_payments (provider, provider_account, external_payment_id) "
+            "WHERE external_payment_id IS NOT NULL"
         )
 
 
@@ -638,6 +696,18 @@ def _observed_order_matches_request(order, payment, data, order_status, payment_
     )
 
 
+def _persist_order_and_payment(db, order=None, payment=None):
+    if order is not None:
+        db.add(order)
+        db.flush()
+    if payment is not None:
+        if order is not None:
+            payment.order_id = order.id
+        db.add(payment)
+        db.flush()
+    return order, payment
+
+
 @app.get("/api/customers")
 def list_customers():
     db = SessionLocal()
@@ -713,8 +783,6 @@ def ingest_observed_order(data: ObservedOrderRequest):
             external_order_id=external_order_id,
             created_at=observed_at,
         )
-        db.add(order)
-        db.flush()
         payment = None
         if payment_status is not None:
             payment = Payment(
@@ -727,7 +795,7 @@ def ingest_observed_order(data: ObservedOrderRequest):
                 ),
                 created_at=observed_at,
             )
-            db.add(payment)
+        _persist_order_and_payment(db, order, payment)
         db.commit()
         db.refresh(order)
         if payment is not None:
@@ -759,6 +827,200 @@ def ingest_observed_order(data: ObservedOrderRequest):
     except Exception:
         db.rollback()
         raise
+    finally:
+        db.close()
+
+
+def _persist_razorpay_payment(db, normalized_payment, provider_account):
+    external_order_id = normalized_payment.external_order_id
+    if external_order_id is None or normalized_payment.occurred_at is None:
+        return "unmapped"
+
+    payment = (
+        db.query(Payment)
+        .filter(
+            Payment.provider == "razorpay",
+            Payment.provider_account == provider_account,
+            Payment.external_payment_id
+            == normalized_payment.external_payment_id,
+        )
+        .first()
+    )
+    order = (
+        db.query(Order)
+        .filter(
+            Order.external_order_id == external_order_id,
+            Order.provider == "razorpay",
+            Order.provider_account == provider_account,
+        )
+        .first()
+    )
+    if payment is not None:
+        payment_order = (
+            db.query(Order).filter(Order.id == payment.order_id).first()
+        )
+        if (
+            payment_order is None
+            or payment_order.id != (order.id if order is not None else None)
+            or payment.amount != normalized_payment.amount
+        ):
+            return "unmapped"
+        if (
+            normalized_payment.customer_id is not None
+            and normalized_payment.customer_id != payment_order.customer_id
+        ):
+            return "unmapped"
+        if payment.status != "succeeded":
+            payment.status = normalized_payment.status
+        if (
+            normalized_payment.status == "succeeded"
+            and payment_order.status != "completed"
+        ):
+            payment_order.status = "completed"
+        return "processed"
+
+    if order is None:
+        conflicting_order = (
+            db.query(Order)
+            .filter(Order.external_order_id == external_order_id)
+            .first()
+        )
+        if conflicting_order is not None:
+            return "unmapped"
+        customer_id = normalized_payment.customer_id
+        if customer_id is None or db.query(Customer).filter(
+            Customer.id == customer_id
+        ).first() is None:
+            return "unmapped"
+        order = Order(
+            customer_id=customer_id,
+            amount=normalized_payment.amount,
+            status=(
+                "completed"
+                if normalized_payment.status == "succeeded"
+                else "payment_failed"
+            ),
+            margin_percent=None,
+            external_order_id=external_order_id,
+            provider="razorpay",
+            provider_account=provider_account,
+            created_at=normalized_payment.occurred_at,
+        )
+        _persist_order_and_payment(db, order)
+    elif (
+        normalized_payment.customer_id is not None
+        and normalized_payment.customer_id != order.customer_id
+    ):
+        return "unmapped"
+
+    payment = Payment(
+        order_id=order.id,
+        status=normalized_payment.status,
+        amount=normalized_payment.amount,
+        provider="razorpay",
+        provider_account=provider_account,
+        external_payment_id=normalized_payment.external_payment_id,
+        created_at=normalized_payment.occurred_at,
+    )
+    _persist_order_and_payment(db, payment=payment)
+    if (
+        normalized_payment.status == "succeeded"
+        and order.status != "completed"
+    ):
+        order.status = "completed"
+    return "processed"
+
+
+@app.post("/api/webhooks/razorpay")
+async def ingest_razorpay_webhook(request: Request):
+    raw_body = await request.body()
+    if len(raw_body) > 1_048_576:
+        raise HTTPException(status_code=413, detail="Webhook payload is too large.")
+
+    secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
+    if not secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Razorpay webhook verification is not configured.",
+        )
+    signature = request.headers.get("X-Razorpay-Signature")
+    if not verify_razorpay_signature(raw_body, signature, secret):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature.")
+
+    event_id = request.headers.get("x-razorpay-event-id", "").strip()
+    if not event_id or len(event_id) > 255:
+        raise HTTPException(status_code=400, detail="Invalid webhook event ID.")
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise HTTPException(status_code=400, detail="Invalid webhook payload.") from error
+
+    normalized = normalize_razorpay_event(payload)
+    if normalized is None:
+        raise HTTPException(status_code=400, detail="Invalid webhook event.")
+    configured_account = os.getenv("RAZORPAY_ACCOUNT_REFERENCE", "default").strip()
+    provider_account = (
+        normalized.account_reference or configured_account or "default"
+    )
+    if len(provider_account) > 255:
+        raise HTTPException(status_code=400, detail="Invalid webhook account reference.")
+
+    db = SessionLocal()
+    try:
+        ledger_event = WebhookEvent(
+            provider="razorpay",
+            provider_account=provider_account,
+            event_id=event_id,
+            event_type=normalized.event_type,
+            event_timestamp=normalized.event_timestamp,
+            processing_status="received",
+            payload_hash=payload_sha256(raw_body),
+        )
+        db.add(ledger_event)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            duplicate = (
+                db.query(WebhookEvent)
+                .filter(
+                    WebhookEvent.provider == "razorpay",
+                    WebhookEvent.provider_account == provider_account,
+                    WebhookEvent.event_id == event_id,
+                )
+                .first()
+            )
+            if duplicate is None:
+                raise
+            return {
+                "status": "success",
+                "duplicate": True,
+                "processing_status": duplicate.processing_status,
+            }
+
+        if normalized.payment is None:
+            ledger_event.processing_status = "ignored"
+        else:
+            ledger_event.processing_status = _persist_razorpay_payment(
+                db,
+                normalized.payment,
+                provider_account,
+            )
+        db.commit()
+        return {
+            "status": "success",
+            "duplicate": False,
+            "processing_status": ledger_event.processing_status,
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Webhook processing failed; the event may be retried.",
+        ) from error
     finally:
         db.close()
 
