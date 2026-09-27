@@ -456,6 +456,55 @@ class LearningLoopTests(unittest.TestCase):
         self.assertEqual(metrics["metrics"]["treatment_orders"], 11)
         self.assertEqual(metrics["metrics"]["treatment_revenue"], 2333)
 
+    def test_razorpay_commerce_snapshot_preserves_normalized_provider_data(self):
+        now = datetime.utcnow()
+        customer = self.add_customer()
+        order = main.Order(
+            customer_id=customer.id,
+            amount=123.45,
+            amount_minor=12345,
+            currency="INR",
+            status="completed",
+            external_order_id="internal-order",
+            provider="razorpay",
+            provider_account="merchant-test",
+            provider_order_id="order_razorpay_test",
+            created_at=now - timedelta(days=2),
+        )
+        self.client_db.add(order)
+        self.client_db.flush()
+        payment = main.Payment(
+            order_id=order.id,
+            status="succeeded",
+            amount=123.45,
+            amount_minor=12345,
+            currency="INR",
+            provider="razorpay",
+            provider_account="merchant-test",
+            external_payment_id="pay_razorpay_test",
+            provider_event_at=now - timedelta(days=1),
+            received_at=now,
+            created_at=now,
+        )
+        self.client_db.add(payment)
+        self.client_db.commit()
+
+        customer_ids, orders, payments = main._commerce_intelligence_inputs(
+            self.client_db
+        )
+        snapshot_order = next(item for item in orders if item.order_id == order.id)
+        snapshot_payment = next(
+            item for item in payments if item.external_payment_id == "pay_razorpay_test"
+        )
+        self.assertIn(customer.id, customer_ids)
+        self.assertEqual(snapshot_order.provider, "razorpay")
+        self.assertEqual(snapshot_order.provider_order_id, "order_razorpay_test")
+        self.assertEqual(snapshot_order.currency, "INR")
+        self.assertEqual(snapshot_order.amount_minor, 12345)
+        self.assertEqual(snapshot_order.created_at, payment.provider_event_at)
+        self.assertEqual(snapshot_payment.provider_account, "merchant-test")
+        self.assertEqual(snapshot_payment.amount_minor, 12345)
+
     def test_evaluation_does_not_finalize_before_window_or_sample(self):
         opportunity = self.add_opportunity("Increase Average Order Value")
         early = self.add_experiment_with_assignments(
@@ -665,6 +714,16 @@ class LearningLoopTests(unittest.TestCase):
             orders.append(
                 CommerceOrder(customer_id, 1000, "completed", now - timedelta(days=120))
             )
+        orders.extend(
+            CommerceOrder(
+                customer_id,
+                1000,
+                "payment_failed",
+                now - timedelta(days=1),
+                order_id=100 + index,
+            )
+            for index, customer_id in enumerate(range(41, 51), start=1)
+        )
         carts = [
             CommerceCartEvent(
                 customer_id, 1000, "checkout_started", now - timedelta(days=1)
@@ -672,7 +731,7 @@ class LearningLoopTests(unittest.TestCase):
             for customer_id in range(31, 41)
         ]
         payments = [
-            CommercePayment(index, customer_id, 1000, "failed")
+            CommercePayment(100 + index, customer_id, 1000, "failed")
             for index, customer_id in enumerate(range(41, 51), start=1)
         ]
         opportunities = detect_opportunities(

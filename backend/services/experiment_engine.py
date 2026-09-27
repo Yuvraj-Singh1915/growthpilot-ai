@@ -12,6 +12,10 @@ from services.opportunity_engine import (
     HIGH_VALUE_CUSTOMER_REVENUE,
     REPEAT_PURCHASE_INACTIVE_DAYS,
     TARGET_AVERAGE_ORDER_VALUE,
+    commerce_order_amount,
+    commerce_payment_amount,
+    is_supported_commerce_order,
+    is_supported_commerce_payment,
 )
 
 
@@ -141,7 +145,9 @@ def get_eligible_customers(
     now = as_of or datetime.utcnow()
     title = opportunity_title.lower()
     completed_orders = [
-        order for order in orders if order.status.lower() == "completed"
+        order
+        for order in orders
+        if order.status.lower() == "completed" and is_supported_commerce_order(order)
     ]
     orders_by_customer: dict[int, list[CommerceOrder]] = {}
     for order in completed_orders:
@@ -172,16 +178,35 @@ def get_eligible_customers(
             customer_id
             for customer_id, customer_orders in orders_by_customer.items()
             if (
-                sum(order.amount for order in customer_orders)
+                sum(commerce_order_amount(order) for order in customer_orders)
                 / len(customer_orders)
             ) < TARGET_AVERAGE_ORDER_VALUE
         )
 
     if "failed payment" in title:
+        orders_by_id = {
+            order.order_id: order
+            for order in orders
+            if order.order_id is not None
+        }
         return sorted({
             payment.customer_id
             for payment in payments
             if payment.status.lower() in {"failed", "declined"}
+            and is_supported_commerce_payment(payment)
+            and commerce_payment_amount(payment) > 0
+            and payment.customer_id in customer_ids
+            and payment.order_id in orders_by_id
+            and orders_by_id[payment.order_id].customer_id == payment.customer_id
+            and (
+                payment.provider != "razorpay"
+                or (
+                    orders_by_id[payment.order_id].provider == "razorpay"
+                    and orders_by_id[payment.order_id].provider_account
+                    == payment.provider_account
+                    and orders_by_id[payment.order_id].currency == payment.currency
+                )
+            )
         })
 
     if "high-value" in title:
@@ -191,7 +216,9 @@ def get_eligible_customers(
             customer_orders = orders_by_customer.get(customer_id, [])
             if not customer_orders:
                 continue
-            lifetime_value = sum(order.amount for order in customer_orders)
+            lifetime_value = sum(
+                commerce_order_amount(order) for order in customer_orders
+            )
             last_purchase = max(order.created_at for order in customer_orders)
             if (
                 lifetime_value >= HIGH_VALUE_CUSTOMER_REVENUE

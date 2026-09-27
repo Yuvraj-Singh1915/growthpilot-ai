@@ -32,6 +32,7 @@ from services.opportunity_engine import (
     CommerceOrder,
     CommercePayment,
     detect_opportunities,
+    razorpay_order_paid_at,
 )
 from services.experiment_engine import (
     assign_variants,
@@ -1016,7 +1017,10 @@ def _persist_razorpay_payment(
     received_at,
 ):
     external_order_id = normalized_payment.external_order_id
-    if external_order_id is None:
+    if (
+        external_order_id is None
+        or normalized_payment.provider_event_at is None
+    ):
         return "unmapped"
 
     order = (
@@ -1082,9 +1086,10 @@ def _persist_razorpay_payment(
                 and incoming_event_at > current_event_at
             ):
                 payment.status = "succeeded"
+                payment.provider_event_at = incoming_event_at
             else:
                 return "conflict"
-        if incoming_event_at is not None:
+        elif current_event_at is None and incoming_event_at is not None:
             payment.provider_event_at = incoming_event_at
         payment.received_at = received_at
         _apply_razorpay_payment_status(db, order, payment.status)
@@ -1428,26 +1433,14 @@ def create_experiment(data: ExperimentRequest):
             )["metrics"]["sample_status"]
             return result
 
-        customers = db.query(Customer).all()
-        orders = db.query(Order).all()
-        carts = db.query(CartEvent).all()
-        payment_rows = (
-            db.query(Payment, Order.customer_id)
-            .join(Order, Payment.order_id == Order.id)
-            .all()
+        customer_ids, commerce_orders, commerce_payments = (
+            _commerce_intelligence_inputs(db)
         )
+        carts = db.query(CartEvent).all()
         eligible_customer_ids = get_eligible_customers(
             opportunity_title=opportunity.title,
-            customer_ids=[customer.id for customer in customers],
-            orders=[
-                CommerceOrder(
-                    customer_id=order.customer_id,
-                    amount=order.amount,
-                    status=order.status,
-                    created_at=order.created_at,
-                )
-                for order in orders
-            ],
+            customer_ids=customer_ids,
+            orders=commerce_orders,
             cart_events=[
                 CommerceCartEvent(
                     customer_id=cart.customer_id,
@@ -1457,15 +1450,7 @@ def create_experiment(data: ExperimentRequest):
                 )
                 for cart in carts
             ],
-            payments=[
-                CommercePayment(
-                    order_id=payment.order_id,
-                    customer_id=customer_id,
-                    amount=payment.amount,
-                    status=payment.status,
-                )
-                for payment, customer_id in payment_rows
-            ],
+            payments=commerce_payments,
         )
         if len(eligible_customer_ids) < 10:
             raise HTTPException(
@@ -1623,6 +1608,67 @@ def _get_experiment_measurement(db, experiment):
         assignments,
         orders,
         payments=payments,
+    )
+
+
+def _commerce_intelligence_inputs(db):
+    customers = db.query(Customer).all()
+    orders = db.query(Order).all()
+    payment_rows = (
+        db.query(Payment, Order.customer_id)
+        .join(Order, Payment.order_id == Order.id)
+        .all()
+    )
+    payments_by_order = {}
+    for payment, _ in payment_rows:
+        payments_by_order.setdefault(payment.order_id, []).append(payment)
+
+    commerce_orders = []
+    for order in orders:
+        created_at = order.created_at
+        status = order.status
+        if order.provider == "razorpay":
+            paid_at = razorpay_order_paid_at(
+                order,
+                payments_by_order.get(order.id, []),
+            )
+            if paid_at is not None:
+                created_at = paid_at
+            elif status == "completed":
+                status = "pending"
+        commerce_orders.append(
+            CommerceOrder(
+                customer_id=order.customer_id,
+                amount=order.amount,
+                status=status,
+                created_at=created_at,
+                order_id=order.id,
+                provider=order.provider,
+                currency=order.currency,
+                amount_minor=order.amount_minor,
+                provider_account=order.provider_account,
+                provider_order_id=order.provider_order_id,
+            )
+        )
+
+    commerce_payments = [
+        CommercePayment(
+            order_id=payment.order_id,
+            customer_id=customer_id,
+            amount=payment.amount,
+            status=payment.status,
+            provider=payment.provider,
+            provider_account=payment.provider_account,
+            external_payment_id=payment.external_payment_id,
+            currency=payment.currency,
+            amount_minor=payment.amount_minor,
+        )
+        for payment, customer_id in payment_rows
+    ]
+    return (
+        [customer.id for customer in customers],
+        commerce_orders,
+        commerce_payments,
     )
 
 
@@ -2028,26 +2074,14 @@ def get_opportunities(data: OpportunityRequest):
             .first()
         )
         settings = latest_goal or data
-        customer_rows = db.query(Customer).all()
-        order_rows = db.query(Order).all()
-        cart_rows = db.query(CartEvent).all()
-        payment_rows = (
-            db.query(Payment, Order.customer_id)
-            .join(Order, Payment.order_id == Order.id)
-            .all()
+        customer_ids, commerce_orders, commerce_payments = (
+            _commerce_intelligence_inputs(db)
         )
+        cart_rows = db.query(CartEvent).all()
 
         opportunities = detect_opportunities(
-            customer_ids=[customer.id for customer in customer_rows],
-            orders=[
-                CommerceOrder(
-                    customer_id=order.customer_id,
-                    amount=order.amount,
-                    status=order.status,
-                    created_at=order.created_at,
-                )
-                for order in order_rows
-            ],
+            customer_ids=customer_ids,
+            orders=commerce_orders,
             cart_events=[
                 CommerceCartEvent(
                     customer_id=cart.customer_id,
@@ -2057,15 +2091,7 @@ def get_opportunities(data: OpportunityRequest):
                 )
                 for cart in cart_rows
             ],
-            payments=[
-                CommercePayment(
-                    order_id=payment.order_id,
-                    customer_id=customer_id,
-                    amount=payment.amount,
-                    status=payment.status,
-                )
-                for payment, customer_id in payment_rows
-            ],
+            payments=commerce_payments,
             max_discount=settings.max_discount,
         )
 

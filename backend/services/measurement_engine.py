@@ -1,6 +1,8 @@
 from datetime import datetime
 from typing import Any, Sequence
 
+from services.opportunity_engine import razorpay_order_paid_at
+
 
 MIN_CUSTOMERS_PER_VARIANT = 10
 MIN_OBSERVATION_DAYS = 7
@@ -9,6 +11,7 @@ MIN_OBSERVATION_DAYS = 7
 def _group_metrics(
     customer_ids: set[int],
     orders_by_customer: dict[int, list[Any]],
+    revenue_by_order: dict[int, float],
 ) -> dict[str, Any]:
     observed_orders = [
         order
@@ -18,7 +21,10 @@ def _group_metrics(
     converted_customers = sum(
         bool(orders_by_customer.get(customer_id)) for customer_id in customer_ids
     )
-    revenue = sum(order.amount for order in observed_orders)
+    revenue = sum(
+        revenue_by_order.get(order.id, order.amount)
+        for order in observed_orders
+    )
     margins = [
         order.margin_percent
         for order in observed_orders
@@ -74,22 +80,50 @@ def calculate_experiment_metrics(
         payments_by_order.setdefault(payment.order_id, []).append(payment)
 
     orders_by_customer: dict[int, list[Any]] = {}
+    revenue_by_order: dict[int, float] = {}
     for order in orders:
         order_payments = payments_by_order.get(order.id, [])
-        payment_is_valid = not order_payments or any(
-            payment.status.lower() in {"succeeded", "successful", "paid", "captured"}
-            for payment in order_payments
-        )
+        currency = getattr(order, "currency", None)
+        provider = getattr(order, "provider", None)
+        amount_minor = getattr(order, "amount_minor", None)
+        payment_event_at = None
+        if provider == "razorpay":
+            if currency != "INR" or not isinstance(amount_minor, int) or amount_minor <= 0:
+                continue
+            payment_event_at = razorpay_order_paid_at(order, order_payments)
+            if payment_event_at is None:
+                continue
+            order_revenue = amount_minor / 100
+        else:
+            if currency not in (None, "INR"):
+                continue
+            payment_is_valid = not order_payments or any(
+                payment.status.lower() in {"succeeded", "successful", "paid", "captured"}
+                and getattr(payment, "currency", None) in (None, "INR")
+                for payment in order_payments
+            )
+            if not payment_is_valid:
+                continue
+            order_revenue = (
+                amount_minor / 100
+                if currency == "INR" and isinstance(amount_minor, int)
+                else order.amount
+            )
+        observed_at = payment_event_at or order.created_at
         if (
             order.customer_id in assigned_customers
             and order.status.lower() == "completed"
-            and payment_is_valid
-            and experiment.started_at <= order.created_at <= now
+            and experiment.started_at <= observed_at <= now
         ):
             orders_by_customer.setdefault(order.customer_id, []).append(order)
+            revenue_by_order[order.id] = order_revenue
 
-    control = _group_metrics(control_customers, orders_by_customer)
-    treatment = _group_metrics(treatment_customers, orders_by_customer)
+    control = _group_metrics(control_customers, orders_by_customer, revenue_by_order)
+    treatment = _group_metrics(
+        treatment_customers,
+        orders_by_customer,
+        revenue_by_order,
+    )
     control_arpc = control["average_revenue_per_customer"]
     treatment_arpc = treatment["average_revenue_per_customer"]
     control_rate = control["conversion_rate"]

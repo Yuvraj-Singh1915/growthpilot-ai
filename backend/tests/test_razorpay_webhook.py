@@ -335,6 +335,15 @@ class RazorpayWebhookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["processing_status"], "unmapped")
         self.assertEqual(self.counts(), (0, 0, 1))
 
+    async def test_payment_without_provider_event_time_is_not_persisted(self):
+        self.create_mapped_order()
+        payload = self.payment_payload()
+        payload.pop("created_at")
+        payload["payload"]["payment"]["entity"].pop("created_at")
+        result = await self.deliver(payload)
+        self.assertEqual(result["processing_status"], "unmapped")
+        self.assertEqual(self.counts(), (1, 0, 1))
+
     async def test_customer_mismatch_does_not_create_a_customer_or_payment(self):
         self.create_mapped_order()
         another_customer = main.Customer(created_at=datetime(2026, 9, 1))
@@ -380,6 +389,14 @@ class RazorpayWebhookTests(unittest.IsolatedAsyncioTestCase):
             created_at=1790499900,
         )
         third = await self.deliver(stale, event_id="evt_payment_stale")
+        duplicate_capture = self.payment_payload(
+            event="payment.captured",
+            created_at=1790500100,
+        )
+        duplicate = await self.deliver(
+            duplicate_capture,
+            event_id="evt_payment_duplicate_capture",
+        )
         newer_failure = self.payment_payload(
             event="payment.failed",
             created_at=1790500120,
@@ -391,6 +408,7 @@ class RazorpayWebhookTests(unittest.IsolatedAsyncioTestCase):
         payment = self.db.query(main.Payment).one()
         self.db.refresh(order)
         self.assertEqual(third["processing_status"], "stale")
+        self.assertEqual(duplicate["processing_status"], "processed")
         self.assertEqual(fourth["processing_status"], "conflict")
         self.assertEqual(payment.status, "succeeded")
         self.assertEqual(
@@ -398,7 +416,7 @@ class RazorpayWebhookTests(unittest.IsolatedAsyncioTestCase):
             datetime.fromtimestamp(1790500060, timezone.utc).replace(tzinfo=None),
         )
         self.assertEqual(order.status, "completed")
-        self.assertEqual(self.counts(), (1, 1, 4))
+        self.assertEqual(self.counts(), (1, 1, 5))
 
     async def test_partial_capture_does_not_mark_order_completed(self):
         order = self.create_mapped_order()

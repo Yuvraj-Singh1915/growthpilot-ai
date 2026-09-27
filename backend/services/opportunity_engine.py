@@ -19,6 +19,12 @@ class CommerceOrder:
     amount: float
     status: str
     created_at: datetime
+    order_id: int | None = None
+    provider: str | None = None
+    currency: str | None = None
+    amount_minor: int | None = None
+    provider_account: str | None = None
+    provider_order_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -35,6 +41,89 @@ class CommercePayment:
     customer_id: int
     amount: float
     status: str
+    provider: str | None = None
+    provider_account: str | None = None
+    external_payment_id: str | None = None
+    currency: str | None = None
+    amount_minor: int | None = None
+
+
+def is_supported_commerce_order(order: CommerceOrder) -> bool:
+    if order.provider == "razorpay":
+        return (
+            order.currency == "INR"
+            and isinstance(order.amount_minor, int)
+            and order.amount_minor > 0
+        )
+    return order.currency in (None, "INR")
+
+
+def commerce_order_amount(order: CommerceOrder) -> float:
+    if order.currency == "INR" and order.amount_minor is not None:
+        return order.amount_minor / 100
+    return order.amount
+
+
+def is_supported_commerce_payment(payment: CommercePayment) -> bool:
+    if payment.provider == "razorpay":
+        return (
+            payment.currency == "INR"
+            and isinstance(payment.amount_minor, int)
+            and payment.amount_minor > 0
+        )
+    return payment.currency in (None, "INR")
+
+
+def commerce_payment_amount(payment: CommercePayment) -> float:
+    if payment.currency == "INR" and payment.amount_minor is not None:
+        return payment.amount_minor / 100
+    return payment.amount
+
+
+def razorpay_order_paid_at(order: Any, payments: Sequence[Any]) -> Any | None:
+    amount_minor = getattr(order, "amount_minor", None)
+    if (
+        getattr(order, "provider", None) != "razorpay"
+        or getattr(order, "currency", None) != "INR"
+        or not isinstance(amount_minor, int)
+        or amount_minor <= 0
+    ):
+        return None
+
+    eligible = []
+    seen_payment_ids = set()
+    for payment in payments:
+        payment_id = getattr(payment, "external_payment_id", None)
+        if (
+            getattr(payment, "provider", None) != "razorpay"
+            or getattr(payment, "provider_account", None)
+            != getattr(order, "provider_account", None)
+            or getattr(payment, "currency", None) != "INR"
+            or payment.status.lower()
+            not in {"succeeded", "successful", "paid", "captured"}
+            or not isinstance(getattr(payment, "amount_minor", None), int)
+            or payment.amount_minor <= 0
+            or getattr(payment, "provider_event_at", None) is None
+            or not payment_id
+        ):
+            continue
+        key = (
+            getattr(payment, "provider", None),
+            getattr(payment, "provider_account", None),
+            payment_id,
+        )
+        if key in seen_payment_ids:
+            continue
+        seen_payment_ids.add(key)
+        eligible.append(payment)
+
+    eligible.sort(key=lambda item: item.provider_event_at)
+    paid_amount_minor = 0
+    for payment in eligible:
+        paid_amount_minor += payment.amount_minor
+        if paid_amount_minor >= amount_minor:
+            return payment.provider_event_at
+    return None
 
 
 @dataclass(frozen=True)
@@ -81,14 +170,18 @@ def detect_opportunities(
 ) -> list[dict[str, Any]]:
     now = as_of or datetime.utcnow()
     completed_orders = [
-        order for order in orders if order.status.lower() == "completed"
+        order
+        for order in orders
+        if order.status.lower() == "completed" and is_supported_commerce_order(order)
     ]
     orders_by_customer: dict[int, list[CommerceOrder]] = {}
     for order in completed_orders:
         orders_by_customer.setdefault(order.customer_id, []).append(order)
 
     order_by_id_customer = {
-        payment.order_id: payment.customer_id for payment in payments
+        order.order_id: order.customer_id
+        for order in orders
+        if order.order_id is not None and order.customer_id in customer_ids
     }
     candidates: list[OpportunityCandidate] = []
     discount_limit = max(0, max_discount)
@@ -132,7 +225,7 @@ def detect_opportunities(
     }
     if repeat_customers:
         previous_revenue = sum(
-            order.amount
+            commerce_order_amount(order)
             for customer_orders in repeat_customers.values()
             for order in customer_orders
         )
@@ -140,7 +233,7 @@ def detect_opportunities(
             len(customer_orders) for customer_orders in repeat_customers.values()
         )
         repeat_value = sum(
-            max(order.amount for order in customer_orders)
+            max(commerce_order_amount(order) for order in customer_orders)
             for customer_orders in repeat_customers.values()
         )
         candidates.append(
@@ -161,7 +254,7 @@ def detect_opportunities(
 
     if completed_orders:
         current_aov = (
-            sum(order.amount for order in completed_orders)
+            sum(commerce_order_amount(order) for order in completed_orders)
             / len(completed_orders)
         )
         if current_aov < TARGET_AVERAGE_ORDER_VALUE:
@@ -184,11 +277,46 @@ def detect_opportunities(
                 )
             )
 
-    failed_payments = [
-        payment for payment in payments if payment.status.lower() in {"failed", "declined"}
-    ]
+    orders_by_id = {
+        order.order_id: order
+        for order in orders
+        if order.order_id is not None
+    }
+    seen_payment_ids: set[tuple[str | None, str | None, str]] = set()
+    failed_payments = []
+    for payment in payments:
+        mapped_order = orders_by_id.get(payment.order_id)
+        if (
+            payment.status.lower() not in {"failed", "declined"}
+            or not is_supported_commerce_payment(payment)
+            or mapped_order is None
+            or mapped_order.customer_id != payment.customer_id
+            or payment.customer_id not in customer_ids
+            or (
+                payment.provider == "razorpay"
+                and (
+                    mapped_order.provider != "razorpay"
+                    or mapped_order.provider_account != payment.provider_account
+                    or mapped_order.currency != payment.currency
+                )
+            )
+            or commerce_payment_amount(payment) <= 0
+        ):
+            continue
+        if payment.external_payment_id:
+            payment_key = (
+                payment.provider,
+                payment.provider_account,
+                payment.external_payment_id,
+            )
+            if payment_key in seen_payment_ids:
+                continue
+            seen_payment_ids.add(payment_key)
+        failed_payments.append(payment)
     if failed_payments:
-        failed_value = sum(payment.amount for payment in failed_payments)
+        failed_value = sum(
+            commerce_payment_amount(payment) for payment in failed_payments
+        )
         failed_customers = {
             order_by_id_customer[payment.order_id]
             for payment in failed_payments
@@ -213,7 +341,9 @@ def detect_opportunities(
     inactive_cutoff = now - timedelta(days=CUSTOMER_INACTIVE_DAYS)
     for customer_id in customer_ids:
         customer_orders = orders_by_customer.get(customer_id, [])
-        lifetime_value = sum(order.amount for order in customer_orders)
+        lifetime_value = sum(
+            commerce_order_amount(order) for order in customer_orders
+        )
         last_purchase = max(
             (order.created_at for order in customer_orders),
             default=None,
@@ -227,7 +357,7 @@ def detect_opportunities(
 
     if high_value_inactive:
         lifetime_revenue = sum(
-            order.amount
+            commerce_order_amount(order)
             for customer_orders in high_value_inactive.values()
             for order in customer_orders
         )
