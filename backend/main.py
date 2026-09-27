@@ -3,6 +3,7 @@ from openai import OpenAI
 import json
 import os
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 from typing import Optional
 from dotenv import load_dotenv
@@ -99,6 +100,16 @@ class Customer(Base):
 
 class Order(Base):
     __tablename__ = "commerce_orders"
+    __table_args__ = (
+        Index(
+            "uq_commerce_orders_provider_external_id",
+            "provider",
+            "provider_account",
+            "provider_order_id",
+            unique=True,
+            sqlite_where=text("provider_order_id IS NOT NULL"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     customer_id = Column(Integer, ForeignKey("commerce_customers.id"), nullable=False)
@@ -108,6 +119,9 @@ class Order(Base):
     external_order_id = Column(String, nullable=True)
     provider = Column(String, nullable=True)
     provider_account = Column(String, nullable=True)
+    provider_order_id = Column(String, nullable=True)
+    amount_minor = Column(Integer, nullable=True)
+    currency = Column(String, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
@@ -141,6 +155,10 @@ class Payment(Base):
     provider = Column(String, nullable=True)
     provider_account = Column(String, nullable=True)
     external_payment_id = Column(String, nullable=True)
+    amount_minor = Column(Integer, nullable=True)
+    currency = Column(String, nullable=True)
+    provider_event_at = Column(DateTime, nullable=True)
+    received_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
@@ -322,11 +340,18 @@ def migrate_learning_loop_columns():
             "external_order_id": "TEXT",
             "provider": "TEXT",
             "provider_account": "TEXT",
+            "provider_order_id": "TEXT",
+            "amount_minor": "INTEGER",
+            "currency": "TEXT",
         },
         "commerce_payments": {
             "provider": "TEXT",
             "provider_account": "TEXT",
             "external_payment_id": "TEXT",
+            "amount_minor": "INTEGER",
+            "currency": "TEXT",
+            "provider_event_at": "DATETIME",
+            "received_at": "DATETIME",
         },
         "experiments": {
             "original_strategy_action": "TEXT",
@@ -371,6 +396,12 @@ def migrate_learning_loop_columns():
             "uq_commerce_payments_provider_external_id "
             "ON commerce_payments (provider, provider_account, external_payment_id) "
             "WHERE external_payment_id IS NOT NULL"
+        )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_commerce_orders_provider_external_id "
+            "ON commerce_orders (provider, provider_account, provider_order_id) "
+            "WHERE provider_order_id IS NOT NULL"
         )
 
 
@@ -645,6 +676,30 @@ class ObservedOrderRequest(BaseModel):
     margin_percent: Optional[float] = None
     payment_status: Optional[str] = None
     payment_amount: Optional[float] = None
+    currency: Optional[str] = None
+    provider: Optional[str] = None
+    provider_account: Optional[str] = None
+    provider_order_id: Optional[str] = None
+
+
+def _inr_amount_minor_units(amount):
+    try:
+        scaled_amount = Decimal(str(amount)) * 100
+    except InvalidOperation as error:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid INR amount.",
+        ) from error
+    if (
+        not scaled_amount.is_finite()
+        or scaled_amount <= 0
+        or scaled_amount != scaled_amount.to_integral_value()
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="INR amounts must be representable in paise.",
+        )
+    return int(scaled_amount)
 
 
 def _serialize_observed_order(order, payment=None, duplicate=False):
@@ -654,8 +709,13 @@ def _serialize_observed_order(order, payment=None, duplicate=False):
         "order": {
             "id": order.id,
             "external_order_id": order.external_order_id,
+            "provider": order.provider,
+            "provider_account": order.provider_account,
+            "provider_order_id": order.provider_order_id,
             "customer_id": order.customer_id,
             "amount": order.amount,
+            "amount_minor": order.amount_minor,
+            "currency": order.currency,
             "status": order.status,
             "margin_percent": order.margin_percent,
             "created_at": order.created_at,
@@ -665,7 +725,11 @@ def _serialize_observed_order(order, payment=None, duplicate=False):
                 "id": payment.id,
                 "status": payment.status,
                 "amount": payment.amount,
+                "amount_minor": payment.amount_minor,
+                "currency": payment.currency,
                 "created_at": payment.created_at,
+                "provider_event_at": payment.provider_event_at,
+                "received_at": payment.received_at,
             }
             if payment is not None
             else None
@@ -674,6 +738,10 @@ def _serialize_observed_order(order, payment=None, duplicate=False):
 
 
 def _observed_order_matches_request(order, payment, data, order_status, payment_status):
+    currency = data.currency.strip().upper() if data.currency else None
+    provider = data.provider.strip().lower() if data.provider else None
+    provider_account = data.provider_account.strip() if data.provider_account else None
+    provider_order_id = data.provider_order_id.strip() if data.provider_order_id else None
     payment_amount = (
         data.payment_amount
         if data.payment_amount is not None
@@ -684,6 +752,10 @@ def _observed_order_matches_request(order, payment, data, order_status, payment_
     return (
         order.customer_id == data.customer_id
         and order.amount == data.amount
+        and order.currency == currency
+        and order.provider == provider
+        and order.provider_account == provider_account
+        and order.provider_order_id == provider_order_id
         and order.status == order_status
         and order.margin_percent == data.margin_percent
         and (
@@ -730,6 +802,10 @@ def ingest_observed_order(data: ObservedOrderRequest):
     external_order_id = data.external_order_id.strip()
     order_status = data.status.strip().lower()
     payment_status = data.payment_status.strip().lower() if data.payment_status else None
+    currency = data.currency.strip().upper() if data.currency else None
+    provider = data.provider.strip().lower() if data.provider else None
+    provider_account = data.provider_account.strip() if data.provider_account else None
+    provider_order_id = data.provider_order_id.strip() if data.provider_order_id else None
     if not external_order_id:
         raise HTTPException(status_code=422, detail="external_order_id is required.")
     if data.amount <= 0:
@@ -746,12 +822,71 @@ def ingest_observed_order(data: ObservedOrderRequest):
         raise HTTPException(status_code=422, detail="payment_status is required with payment_amount.")
     if data.payment_amount is not None and data.payment_amount <= 0:
         raise HTTPException(status_code=422, detail="payment_amount must be greater than zero.")
+    if currency is not None and currency != "INR":
+        raise HTTPException(status_code=422, detail="Only INR orders are supported.")
+    provider_mapping_fields = (provider, provider_account, provider_order_id)
+    if any(provider_mapping_fields) and not all(provider_mapping_fields):
+        raise HTTPException(
+            status_code=422,
+            detail="provider, provider_account, and provider_order_id must be supplied together.",
+        )
+    if provider is not None and provider != "razorpay":
+        raise HTTPException(status_code=422, detail="Only Razorpay provider mappings are supported.")
+    if (
+        provider == "razorpay"
+        and os.getenv("RAZORPAY_MODE", "test").strip().lower() != "test"
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Only Razorpay test mode is configured in this phase.",
+        )
+    if provider_order_id is not None and len(provider_order_id) > 255:
+        raise HTTPException(status_code=422, detail="provider_order_id is too long.")
+    if provider_account is not None and len(provider_account) > 255:
+        raise HTTPException(status_code=422, detail="provider_account is too long.")
+    if provider is not None and currency != "INR":
+        raise HTTPException(
+            status_code=422,
+            detail="Razorpay order mappings require an explicit INR currency.",
+        )
+    order_amount_minor = (
+        _inr_amount_minor_units(data.amount) if currency == "INR" else None
+    )
+    payment_amount_value = (
+        data.payment_amount
+        if data.payment_amount is not None
+        else data.amount
+        if payment_status is not None
+        else None
+    )
+    payment_amount_minor = (
+        _inr_amount_minor_units(payment_amount_value)
+        if currency == "INR" and payment_amount_value is not None
+        else None
+    )
 
     db = SessionLocal()
     try:
         customer = db.query(Customer).filter(Customer.id == data.customer_id).first()
         if customer is None:
             raise HTTPException(status_code=404, detail="Customer not found.")
+
+        if provider_order_id is not None:
+            mapped_order = (
+                db.query(Order)
+                .filter(
+                    Order.provider == provider,
+                    Order.provider_account == provider_account,
+                    Order.provider_order_id == provider_order_id,
+                    Order.external_order_id != external_order_id,
+                )
+                .first()
+            )
+            if mapped_order is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="provider_order_id is already mapped to another order.",
+                )
 
         existing = (
             db.query(Order)
@@ -781,6 +916,11 @@ def ingest_observed_order(data: ObservedOrderRequest):
             status=order_status,
             margin_percent=data.margin_percent,
             external_order_id=external_order_id,
+            provider=provider,
+            provider_account=provider_account,
+            provider_order_id=provider_order_id,
+            amount_minor=order_amount_minor,
+            currency=currency,
             created_at=observed_at,
         )
         payment = None
@@ -789,10 +929,10 @@ def ingest_observed_order(data: ObservedOrderRequest):
                 order_id=order.id,
                 status=payment_status,
                 amount=(
-                    data.payment_amount
-                    if data.payment_amount is not None
-                    else data.amount
+                    payment_amount_value
                 ),
+                amount_minor=payment_amount_minor,
+                currency=currency,
                 created_at=observed_at,
             )
         _persist_order_and_payment(db, order, payment)
@@ -809,6 +949,21 @@ def ingest_observed_order(data: ObservedOrderRequest):
             .first()
         )
         if existing is None:
+            if provider_order_id is not None:
+                mapped_order = (
+                    db.query(Order)
+                    .filter(
+                        Order.provider == provider,
+                        Order.provider_account == provider_account,
+                        Order.provider_order_id == provider_order_id,
+                    )
+                    .first()
+                )
+                if mapped_order is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="provider_order_id is already mapped to another order.",
+                    ) from error
             raise error
         payment = (
             db.query(Payment)
@@ -831,10 +986,61 @@ def ingest_observed_order(data: ObservedOrderRequest):
         db.close()
 
 
-def _persist_razorpay_payment(db, normalized_payment, provider_account):
+def _apply_razorpay_payment_status(db, order, payment_status):
+    db.flush()
+    succeeded_amount_minor = (
+        db.query(func.coalesce(func.sum(Payment.amount_minor), 0))
+        .filter(
+            Payment.order_id == order.id,
+            Payment.provider == "razorpay",
+            Payment.provider_account == order.provider_account,
+            Payment.currency == order.currency,
+            Payment.status == "succeeded",
+        )
+        .scalar()
+    )
+    if succeeded_amount_minor >= order.amount_minor:
+        order.status = "completed"
+    elif order.status not in {"completed", "cancelled"}:
+        order.status = (
+            "payment_failed"
+            if payment_status == "failed" and succeeded_amount_minor == 0
+            else "pending"
+        )
+
+
+def _persist_razorpay_payment(
+    db,
+    normalized_payment,
+    provider_account,
+    received_at,
+):
     external_order_id = normalized_payment.external_order_id
-    if external_order_id is None or normalized_payment.occurred_at is None:
+    if external_order_id is None:
         return "unmapped"
+
+    order = (
+        db.query(Order)
+        .filter(
+            Order.provider == "razorpay",
+            Order.provider_account == provider_account,
+            Order.provider_order_id == external_order_id,
+        )
+        .first()
+    )
+    if order is None:
+        return "unmapped"
+    if normalized_payment.customer_reference_invalid:
+        return "unmapped"
+    if order.currency != normalized_payment.currency:
+        return "conflict"
+    if (
+        normalized_payment.customer_id is not None
+        and normalized_payment.customer_id != order.customer_id
+    ):
+        return "conflict"
+    if order.status == "cancelled" and normalized_payment.status == "succeeded":
+        return "conflict"
 
     payment = (
         db.query(Payment)
@@ -846,88 +1052,59 @@ def _persist_razorpay_payment(db, normalized_payment, provider_account):
         )
         .first()
     )
-    order = (
-        db.query(Order)
-        .filter(
-            Order.external_order_id == external_order_id,
-            Order.provider == "razorpay",
-            Order.provider_account == provider_account,
-        )
-        .first()
-    )
     if payment is not None:
         payment_order = (
             db.query(Order).filter(Order.id == payment.order_id).first()
         )
         if (
             payment_order is None
-            or payment_order.id != (order.id if order is not None else None)
-            or payment.amount != normalized_payment.amount
+            or payment_order.id != order.id
+            or payment.amount_minor != normalized_payment.amount_minor
+            or payment.currency != normalized_payment.currency
+            or payment_order.provider_order_id != external_order_id
         ):
-            return "unmapped"
-        if (
-            normalized_payment.customer_id is not None
-            and normalized_payment.customer_id != payment_order.customer_id
-        ):
-            return "unmapped"
-        if payment.status != "succeeded":
-            payment.status = normalized_payment.status
-        if (
-            normalized_payment.status == "succeeded"
-            and payment_order.status != "completed"
-        ):
-            payment_order.status = "completed"
-        return "processed"
+            return "conflict"
 
-    if order is None:
-        conflicting_order = (
-            db.query(Order)
-            .filter(Order.external_order_id == external_order_id)
-            .first()
-        )
-        if conflicting_order is not None:
-            return "unmapped"
-        customer_id = normalized_payment.customer_id
-        if customer_id is None or db.query(Customer).filter(
-            Customer.id == customer_id
-        ).first() is None:
-            return "unmapped"
-        order = Order(
-            customer_id=customer_id,
-            amount=normalized_payment.amount,
-            status=(
-                "completed"
-                if normalized_payment.status == "succeeded"
-                else "payment_failed"
-            ),
-            margin_percent=None,
-            external_order_id=external_order_id,
-            provider="razorpay",
-            provider_account=provider_account,
-            created_at=normalized_payment.occurred_at,
-        )
-        _persist_order_and_payment(db, order)
-    elif (
-        normalized_payment.customer_id is not None
-        and normalized_payment.customer_id != order.customer_id
-    ):
-        return "unmapped"
+        current_event_at = payment.provider_event_at
+        incoming_event_at = normalized_payment.provider_event_at
+        if (
+            current_event_at is not None
+            and incoming_event_at is not None
+            and incoming_event_at < current_event_at
+        ):
+            return "stale"
+        if payment.status != normalized_payment.status:
+            if (
+                payment.status == "failed"
+                and normalized_payment.status == "succeeded"
+                and current_event_at is not None
+                and incoming_event_at is not None
+                and incoming_event_at > current_event_at
+            ):
+                payment.status = "succeeded"
+            else:
+                return "conflict"
+        if incoming_event_at is not None:
+            payment.provider_event_at = incoming_event_at
+        payment.received_at = received_at
+        _apply_razorpay_payment_status(db, order, payment.status)
+        return "processed"
 
     payment = Payment(
         order_id=order.id,
         status=normalized_payment.status,
-        amount=normalized_payment.amount,
+        amount=normalized_payment.amount_minor / 100,
+        amount_minor=normalized_payment.amount_minor,
+        currency=normalized_payment.currency,
         provider="razorpay",
         provider_account=provider_account,
         external_payment_id=normalized_payment.external_payment_id,
-        created_at=normalized_payment.occurred_at,
+        provider_event_at=normalized_payment.provider_event_at,
+        received_at=received_at,
+        created_at=received_at,
     )
     _persist_order_and_payment(db, payment=payment)
-    if (
-        normalized_payment.status == "succeeded"
-        and order.status != "completed"
-    ):
-        order.status = "completed"
+    _apply_razorpay_payment_status(db, order, normalized_payment.status)
     return "processed"
 
 
@@ -937,6 +1114,11 @@ async def ingest_razorpay_webhook(request: Request):
     if len(raw_body) > 1_048_576:
         raise HTTPException(status_code=413, detail="Webhook payload is too large.")
 
+    if os.getenv("RAZORPAY_MODE", "test").strip().lower() != "test":
+        raise HTTPException(
+            status_code=503,
+            detail="Only Razorpay test mode is configured in this phase.",
+        )
     secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
     if not secret:
         raise HTTPException(
@@ -958,21 +1140,26 @@ async def ingest_razorpay_webhook(request: Request):
     normalized = normalize_razorpay_event(payload)
     if normalized is None:
         raise HTTPException(status_code=400, detail="Invalid webhook event.")
-    configured_account = os.getenv("RAZORPAY_ACCOUNT_REFERENCE", "default").strip()
-    provider_account = (
-        normalized.account_reference or configured_account or "default"
-    )
+    configured_account = os.getenv("RAZORPAY_ACCOUNT_REFERENCE", "").strip()
+    provider_account = normalized.account_reference or configured_account
+    if not provider_account:
+        raise HTTPException(
+            status_code=503,
+            detail="Razorpay account reference is not configured.",
+        )
     if len(provider_account) > 255:
         raise HTTPException(status_code=400, detail="Invalid webhook account reference.")
 
     db = SessionLocal()
     try:
+        received_at = datetime.utcnow()
         ledger_event = WebhookEvent(
             provider="razorpay",
             provider_account=provider_account,
             event_id=event_id,
             event_type=normalized.event_type,
             event_timestamp=normalized.event_timestamp,
+            received_at=received_at,
             processing_status="received",
             payload_hash=payload_sha256(raw_body),
         )
@@ -999,12 +1186,17 @@ async def ingest_razorpay_webhook(request: Request):
             }
 
         if normalized.payment is None:
-            ledger_event.processing_status = "ignored"
+            ledger_event.processing_status = (
+                "ignored_unsupported_currency"
+                if normalized.ignored_reason == "unsupported_currency"
+                else "ignored"
+            )
         else:
             ledger_event.processing_status = _persist_razorpay_payment(
                 db,
                 normalized.payment,
                 provider_account,
+                received_at,
             )
         db.commit()
         return {
@@ -1037,8 +1229,13 @@ def list_orders():
                 {
                     "id": order.id,
                     "external_order_id": order.external_order_id,
+                    "provider": order.provider,
+                    "provider_account": order.provider_account,
+                    "provider_order_id": order.provider_order_id,
                     "customer_id": order.customer_id,
                     "amount": order.amount,
+                    "amount_minor": order.amount_minor,
+                    "currency": order.currency,
                     "status": order.status,
                     "margin_percent": order.margin_percent,
                     "created_at": order.created_at,

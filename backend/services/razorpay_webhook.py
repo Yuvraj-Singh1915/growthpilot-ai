@@ -15,9 +15,11 @@ class NormalizedRazorpayPayment:
     external_order_id: str | None
     external_payment_id: str
     customer_id: int | None
+    customer_reference_invalid: bool
     status: str
-    amount: float
-    occurred_at: datetime | None
+    amount_minor: int
+    currency: str
+    provider_event_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,7 @@ class NormalizedRazorpayEvent:
     event_timestamp: datetime | None
     account_reference: str | None
     payment: NormalizedRazorpayPayment | None
+    ignored_reason: str | None = None
 
 
 def verify_razorpay_signature(
@@ -75,6 +78,8 @@ def normalize_razorpay_event(payload: Any) -> NormalizedRazorpayEvent | None:
     account_reference = payload.get("account_id")
     if not isinstance(account_reference, str) or not account_reference.strip():
         account_reference = None
+    else:
+        account_reference = account_reference.strip()
 
     if event_type not in {"payment.captured", "payment.failed"}:
         return NormalizedRazorpayEvent(
@@ -104,12 +109,28 @@ def normalize_razorpay_event(payload: Any) -> NormalizedRazorpayEvent | None:
         or isinstance(amount_minor, bool)
         or not isinstance(amount_minor, int)
         or amount_minor <= 0
-        or currency != "INR"
+        or not isinstance(currency, str)
+        or not re.fullmatch(r"[A-Z]{3}", currency)
         or status != expected_status
     ):
         return None
 
-    occurred_at = event_timestamp or _unix_timestamp(entity.get("created_at"))
+    if currency != "INR":
+        return NormalizedRazorpayEvent(
+            event_type=event_type,
+            event_timestamp=event_timestamp,
+            account_reference=account_reference,
+            payment=None,
+            ignored_reason="unsupported_currency",
+        )
+
+    notes = entity.get("notes")
+    customer_id = _customer_id(notes)
+    customer_reference_invalid = (
+        isinstance(notes, dict)
+        and "growthpilot_customer_id" in notes
+        and customer_id is None
+    )
     return NormalizedRazorpayEvent(
         event_type=event_type,
         event_timestamp=event_timestamp,
@@ -118,10 +139,12 @@ def normalize_razorpay_event(payload: Any) -> NormalizedRazorpayEvent | None:
             event_type=event_type,
             external_order_id=order_id.strip() if order_id and order_id.strip() else None,
             external_payment_id=payment_id.strip(),
-            customer_id=_customer_id(entity.get("notes")),
+            customer_id=customer_id,
+            customer_reference_invalid=customer_reference_invalid,
             status="succeeded" if expected_status == "captured" else "failed",
-            amount=amount_minor / 100,
-            occurred_at=occurred_at,
+            amount_minor=amount_minor,
+            currency=currency,
+            provider_event_at=event_timestamp,
         ),
     )
 
