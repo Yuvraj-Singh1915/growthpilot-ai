@@ -22,6 +22,17 @@ type DecisionResult = {
   approval_required: boolean;
 };
 
+type ExperimentEvaluation = {
+  decision?: string;
+  reason?: string;
+  next_action?: string;
+};
+
+type EvaluationResult = {
+  experiment_status?: string;
+  evaluation?: string | ExperimentEvaluation;
+};
+
 type ExperimentResult = {
   status: string;
   experiment_status?: string;
@@ -110,6 +121,52 @@ type NextActionResult = {
   advisory_only: boolean;
 };
 
+async function getApiErrorMessage(response: Response, fallback: string) {
+  try {
+    const body: unknown = await response.json();
+    if (
+      typeof body === "object" &&
+      body !== null &&
+      "detail" in body &&
+      typeof body.detail === "string"
+    ) {
+      return body.detail;
+    }
+  } catch {
+    // Use the status-based message when the response is not JSON.
+  }
+
+  return `${fallback} (HTTP ${response.status}).`;
+}
+
+function parseExperimentEvaluation(
+  evaluation: EvaluationResult["evaluation"]
+): ExperimentEvaluation | undefined {
+  if (typeof evaluation !== "string") {
+    return evaluation;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(evaluation);
+    if (typeof parsed !== "object" || parsed === null) {
+      return undefined;
+    }
+
+    const result = parsed as Record<string, unknown>;
+    if (
+      ["decision", "reason", "next_action"].every(
+        (field) => result[field] === undefined || typeof result[field] === "string"
+      )
+    ) {
+      return result as ExperimentEvaluation;
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+}
+
 export default function Home() {
   const [autopilot, setAutopilot] = useState(true);
 
@@ -121,15 +178,18 @@ export default function Home() {
   const [editingGoal, setEditingGoal] = useState(false);
   const [savingGoal, setSavingGoal] = useState(false);
   const [apiStatus, setApiStatus] = useState("");
+  const [apiStatusIsError, setApiStatusIsError] = useState(false);
 
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [loadingOpportunities, setLoadingOpportunities] = useState(false);
+  const [opportunityError, setOpportunityError] = useState("");
   const [seedingDemoData, setSeedingDemoData] = useState(false);
   const [demoSeedMessage, setDemoSeedMessage] = useState("");
 
   const [decisionResults, setDecisionResults] = useState<
     Record<number, DecisionResult>
   >({});
+  const [decisionErrors, setDecisionErrors] = useState<Record<number, string>>({});
 
   const [experimentResults, setExperimentResults] = useState<
     Record<number, ExperimentResult>
@@ -140,7 +200,9 @@ export default function Home() {
   >({});
 
   const [loadingDecision, setLoadingDecision] = useState<number | null>(null);
-  const [evaluationResults, setEvaluationResults] = useState<Record<number, any>>({});
+  const [evaluationResults, setEvaluationResults] = useState<
+    Record<number, EvaluationResult>
+  >({});
   const [loadingEvaluation, setLoadingEvaluation] = useState<number | null>(null);
   const [learningRecords, setLearningRecords] = useState<LearningRecord[]>([]);
   const [learningTotal, setLearningTotal] = useState(0);
@@ -159,6 +221,7 @@ export default function Home() {
 
   const loadOpportunities = async () => {
     setLoadingOpportunities(true);
+    setOpportunityError("");
 
     try {
       const response = await fetch(
@@ -178,7 +241,9 @@ export default function Home() {
       );
 
       if (!response.ok) {
-        throw new Error("Failed to load opportunities");
+        throw new Error(
+          await getApiErrorMessage(response, "Failed to load opportunities.")
+        );
       }
 
       const data = await response.json();
@@ -186,6 +251,11 @@ export default function Home() {
       setOpportunities(data.opportunities);
     } catch (error) {
       console.error("Opportunity Engine error:", error);
+      setOpportunityError(
+        error instanceof Error
+          ? error.message
+          : "Could not load opportunities. Check that the backend is running."
+      );
     } finally {
       setLoadingOpportunities(false);
     }
@@ -232,7 +302,9 @@ export default function Home() {
         }
       );
       if (!response.ok) {
-        throw new Error("Failed to get the next best action");
+        throw new Error(
+          await getApiErrorMessage(response, "Failed to get the next best action.")
+        );
       }
       const data = await response.json();
       setNextActionResults((previous) => ({
@@ -243,7 +315,10 @@ export default function Home() {
       console.error("Autopilot next-action error:", error);
       setNextActionErrors((previous) => ({
         ...previous,
-        [index]: "Could not get a next-action recommendation. Check that the backend is running.",
+        [index]:
+          error instanceof Error
+            ? error.message
+            : "Could not get a next-action recommendation. Check that the backend is running.",
       }));
     } finally {
       setLoadingNextAction(null);
@@ -259,7 +334,11 @@ export default function Home() {
   // AI DECISION → EXPERIMENT → MEASUREMENT
   // ---------------------------------------
 
-  const runDecision = async (index: number, opportunity: any) => {
+  const runDecision = async (index: number, opportunity: Opportunity) => {
+  setDecisionErrors((previous) => ({
+    ...previous,
+    [index]: "",
+  }));
   setLoadingDecision(index);
 
   try {
@@ -281,7 +360,9 @@ export default function Home() {
     });
 
     if (!response.ok) {
-      throw new Error("Decision Engine failed");
+      throw new Error(
+        await getApiErrorMessage(response, "Strategy request failed.")
+      );
     }
 
     const data = await response.json();
@@ -325,7 +406,12 @@ export default function Home() {
     );
 
     if (!experimentResponse.ok) {
-      throw new Error("Experiment Engine failed");
+      throw new Error(
+        await getApiErrorMessage(
+          experimentResponse,
+          "Experiment launch failed."
+        )
+      );
     }
 
     const experimentData = await experimentResponse.json();
@@ -367,7 +453,9 @@ export default function Home() {
     );
 
     if (!measurementResponse.ok) {
-      throw new Error("Measurement Engine failed");
+      throw new Error(
+        await getApiErrorMessage(measurementResponse, "Measurement request failed.")
+      );
     }
 
     const measurementData = await measurementResponse.json();
@@ -400,10 +488,12 @@ export default function Home() {
     );
 
     if (!evaluationResponse.ok) {
-      throw new Error("AI Evaluation Engine failed");
+      throw new Error(
+        await getApiErrorMessage(evaluationResponse, "Evaluation request failed.")
+      );
     }
 
-    const evaluationData = await evaluationResponse.json();
+    const evaluationData: EvaluationResult = await evaluationResponse.json();
 
     setEvaluationResults((prev) => ({
       ...prev,
@@ -421,6 +511,13 @@ export default function Home() {
     await loadLearningMemory();
   } catch (error) {
     console.error("GrowthPilot AI flow error:", error);
+    setDecisionErrors((previous) => ({
+      ...previous,
+      [index]:
+        error instanceof Error
+          ? error.message
+          : "The growth flow could not be completed. Please try again.",
+    }));
   } finally {
     setLoadingDecision(null);
     setLoadingEvaluation(null);
@@ -639,11 +736,13 @@ export default function Home() {
               if (!editingGoal) {
                 setEditingGoal(true);
                 setApiStatus("");
+                setApiStatusIsError(false);
                 return;
               }
 
               setSavingGoal(true);
               setApiStatus("");
+              setApiStatusIsError(false);
 
               try {
                 const response = await fetch(
@@ -667,17 +766,19 @@ export default function Home() {
 
                 if (!response.ok) {
                   throw new Error(
-                    "Failed to save goal"
+                    await getApiErrorMessage(response, "Failed to save goal.")
                   );
                 }
 
                 setEditingGoal(false);
-                setApiStatus(
-                  "Goal saved successfully"
-                );
+                await loadOpportunities();
+                setApiStatus("Goal saved successfully");
               } catch (error) {
+                setApiStatusIsError(true);
                 setApiStatus(
-                  "Backend connection failed"
+                  error instanceof Error
+                    ? error.message
+                    : "Could not save the growth goal. Check that the backend is running."
                 );
               } finally {
                 setSavingGoal(false);
@@ -693,7 +794,12 @@ export default function Home() {
           </button>
 
           {apiStatus && (
-            <p className="mt-3 text-sm text-green-400">
+            <p
+              className={`mt-3 text-sm ${
+                apiStatusIsError ? "text-red-300" : "text-green-400"
+              }`}
+              role={apiStatusIsError ? "alert" : undefined}
+            >
               {apiStatus}
             </p>
           )}
@@ -893,6 +999,10 @@ export default function Home() {
               <p className="mt-6 text-slate-400">
                 AI is analyzing opportunities...
               </p>
+            ) : opportunityError ? (
+              <p className="mt-6 text-sm text-red-300" role="alert">
+                {opportunityError}
+              </p>
             ) : opportunities.length > 0 ? (
               <div className="mt-6 space-y-4">
 
@@ -977,6 +1087,11 @@ export default function Home() {
                               ? "Analyzing..."
                               : "Run AI Decision"}
                           </button>
+                          {decisionErrors[index] && (
+                            <p className="mt-2 text-sm text-red-300" role="alert">
+                              {decisionErrors[index]}
+                            </p>
+                          )}
 
                           <button
                             onClick={() => void requestNextAction(index, item)}
@@ -1136,20 +1251,9 @@ export default function Home() {
 
                               {evaluationResults[index] &&
                                 (() => {
-                                  let evaluation =
-                                    evaluationResults[index]?.evaluation;
-
-                                  try {
-                                    if (
-                                      typeof evaluation ===
-                                      "string"
-                                    ) {
-                                      evaluation =
-                                        JSON.parse(evaluation);
-                                    }
-                                  } catch {
-                                    // Keep the original value when it is not valid JSON.
-                                  }
+                                  const evaluation = parseExperimentEvaluation(
+                                    evaluationResults[index]?.evaluation
+                                  );
 
                                   return (
                                     <div className="mt-4 border-t border-slate-800 pt-4">
@@ -1651,7 +1755,7 @@ export default function Home() {
               />
 
               <Check
-                text="Inventory availability: verified"
+                text="Inventory verification: not available"
               />
 
             </div>

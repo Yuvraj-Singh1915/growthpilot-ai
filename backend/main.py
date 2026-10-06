@@ -42,7 +42,10 @@ from services.experiment_engine import (
     get_eligible_customers,
     variant_definition,
 )
-from services.measurement_engine import calculate_experiment_metrics
+from services.measurement_engine import (
+    MIN_CUSTOMERS_PER_VARIANT,
+    calculate_experiment_metrics,
+)
 from services.learning_engine import build_learning_evidence
 from services.razorpay_webhook import (
     normalize_razorpay_event,
@@ -1452,16 +1455,34 @@ def create_experiment(data: ExperimentRequest):
             ],
             payments=commerce_payments,
         )
-        if len(eligible_customer_ids) < 10:
-            raise HTTPException(
-                status_code=409,
-                detail="At least 10 eligible customers are required to create a 90/10 experiment.",
-            )
-
         now = datetime.utcnow()
         experiment_public_id = (
             f"EXP-{now.strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8].upper()}"
         )
+        planned_assignments = assign_variants(
+            experiment_public_id,
+            eligible_customer_ids,
+        )
+        planned_control_count = sum(
+            variant == "CONTROL" for _, variant in planned_assignments
+        )
+        planned_treatment_count = sum(
+            variant == "TREATMENT" for _, variant in planned_assignments
+        )
+        if (
+            planned_control_count < MIN_CUSTOMERS_PER_VARIANT
+            or planned_treatment_count < MIN_CUSTOMERS_PER_VARIANT
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Insufficient eligible customers for a 90/10 experiment: "
+                    f"the planned assignment has {planned_control_count} control "
+                    f"and {planned_treatment_count} treatment customers; at least "
+                    f"{MIN_CUSTOMERS_PER_VARIANT} are required in each arm."
+                ),
+            )
+
         hypothesis = build_hypothesis(
             opportunity.title,
             opportunity.suggested_discount,
@@ -1502,10 +1523,7 @@ def create_experiment(data: ExperimentRequest):
                 variant=variant,
                 assigned_at=now,
             )
-            for customer_id, variant in assign_variants(
-                experiment_public_id,
-                eligible_customer_ids,
-            )
+            for customer_id, variant in planned_assignments
         ]
         db.add_all(assignments)
         db.commit()
@@ -1893,7 +1911,7 @@ def evaluate_result(data: ResultEvaluationRequest):
             }
         else:
             evaluation, evaluation_is_final = _request_ai_experiment_evaluation(
-                experiment, metrics
+                experiment, metric_snapshot
             )
 
         if evaluation_is_final and experiment.status != "PAUSED":

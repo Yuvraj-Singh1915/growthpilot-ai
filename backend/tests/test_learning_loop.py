@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -53,6 +54,12 @@ class LearningLoopTests(unittest.TestCase):
         self.client_db.add(customer)
         self.client_db.flush()
         return customer
+
+    def add_aov_eligible_customers(self, count):
+        now = datetime.utcnow()
+        for _ in range(count):
+            customer = self.add_customer()
+            self.add_order(customer.id, 1200, now)
 
     def add_opportunity(self, title, discount=0):
         opportunity = main.Opportunity(
@@ -192,6 +199,17 @@ class LearningLoopTests(unittest.TestCase):
         case_a = self.create_approved_experiment(
             aov.title, "Increase AOV using targeted offer"
         )
+        first_assignments = (
+            self.client_db.query(main.ExperimentAssignment)
+            .join(main.Experiment)
+            .filter(main.Experiment.experiment_id == case_a["experiment_id"])
+            .order_by(main.ExperimentAssignment.id)
+            .all()
+        )
+        original_assignment_snapshot = [
+            (item.id, item.customer_id, item.variant, item.assigned_at)
+            for item in first_assignments
+        ]
         repeated = self.create_approved_experiment(
             aov.title, "Increase AOV using targeted offer"
         )
@@ -215,6 +233,87 @@ class LearningLoopTests(unittest.TestCase):
             carts.title, "Send personalized recovery offer"
         )
         self.assertNotEqual(case_c["experiment_id"], case_d["experiment_id"])
+        assignments_after_reuse = (
+            self.client_db.query(main.ExperimentAssignment)
+            .join(main.Experiment)
+            .filter(main.Experiment.experiment_id == case_a["experiment_id"])
+            .order_by(main.ExperimentAssignment.id)
+            .all()
+        )
+        self.assertEqual(
+            [
+                (item.id, item.customer_id, item.variant, item.assigned_at)
+                for item in assignments_after_reuse
+            ],
+            original_assignment_snapshot,
+        )
+
+    def test_experiment_launch_rejects_95_eligible_customers_without_writes(self):
+        self.add_aov_eligible_customers(95)
+        opportunity = self.add_opportunity("Increase Average Order Value")
+        self.client_db.commit()
+        models = (
+            main.MerchantGoal,
+            main.Opportunity,
+            main.Customer,
+            main.Order,
+            main.CartEvent,
+            main.Payment,
+            main.WebhookEvent,
+            main.Experiment,
+            main.ExperimentAssignment,
+            main.ExperimentEvaluation,
+            main.LearningRecord,
+        )
+        record_counts_before = {
+            model.__tablename__: self.client_db.query(model).count()
+            for model in models
+        }
+
+        with self.assertRaises(HTTPException) as raised:
+            self.create_approved_experiment(
+                opportunity.title,
+                "Increase AOV using targeted offer",
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("86 control", raised.exception.detail)
+        self.assertIn("9 treatment", raised.exception.detail)
+        self.assertEqual(
+            {
+                model.__tablename__: self.client_db.query(model).count()
+                for model in models
+            },
+            record_counts_before,
+        )
+
+    def test_experiment_launch_accepts_96_as_86_control_10_treatment(self):
+        self.add_aov_eligible_customers(96)
+        opportunity = self.add_opportunity("Increase Average Order Value")
+        self.client_db.commit()
+
+        launched = self.create_approved_experiment(
+            opportunity.title,
+            "Increase AOV using targeted offer",
+        )
+
+        self.assertEqual(launched["status"], "launched")
+        self.assertEqual(launched["assigned_customers"]["control"], 86)
+        self.assertEqual(launched["assigned_customers"]["treatment"], 10)
+        assignments = (
+            self.client_db.query(main.ExperimentAssignment)
+            .join(main.Experiment)
+            .filter(main.Experiment.experiment_id == launched["experiment_id"])
+            .all()
+        )
+        self.assertEqual(
+            sum(item.variant == "CONTROL" for item in assignments),
+            86,
+        )
+        self.assertEqual(
+            sum(item.variant == "TREATMENT" for item in assignments),
+            10,
+        )
 
     def test_legacy_active_experiment_with_old_split_is_preserved_not_reused(self):
         now = datetime.utcnow()
@@ -248,16 +347,26 @@ class LearningLoopTests(unittest.TestCase):
         )
         self.client_db.add(legacy)
         self.client_db.flush()
-        for index, customer in enumerate(customers):
+        for index, customer in enumerate(customers[:40]):
             self.client_db.add(
                 main.ExperimentAssignment(
                     experiment_id=legacy.id,
                     customer_id=customer.id,
-                    variant="CONTROL" if index < 10 else "TREATMENT",
+                    variant="CONTROL" if index < 4 else "TREATMENT",
                     assigned_at=now,
                 )
             )
         self.client_db.commit()
+        legacy_assignments_before = (
+            self.client_db.query(main.ExperimentAssignment)
+            .filter(main.ExperimentAssignment.experiment_id == legacy.id)
+            .order_by(main.ExperimentAssignment.id)
+            .all()
+        )
+        legacy_assignment_snapshot = [
+            (item.id, item.customer_id, item.variant, item.assigned_at)
+            for item in legacy_assignments_before
+        ]
 
         created = self.create_approved_experiment(
             opportunity.title,
@@ -281,7 +390,14 @@ class LearningLoopTests(unittest.TestCase):
             variant: sum(item.variant == variant for item in legacy_assignments)
             for variant in {"CONTROL", "TREATMENT"}
         }
-        self.assertEqual(old_counts, {"CONTROL": 10, "TREATMENT": 90})
+        self.assertEqual(old_counts, {"CONTROL": 4, "TREATMENT": 36})
+        self.assertEqual(
+            [
+                (item.id, item.customer_id, item.variant, item.assigned_at)
+                for item in legacy_assignments
+            ],
+            legacy_assignment_snapshot,
+        )
 
     def test_observed_order_ingestion_is_validated_and_idempotent(self):
         customer = self.add_customer()
@@ -527,15 +643,104 @@ class LearningLoopTests(unittest.TestCase):
         underpowered = self.add_experiment_with_assignments(
             underpowered_opportunity,
             "Recommend a reorder reminder",
-            control_count=9,
-            treatment_count=10,
+            control_count=4,
+            treatment_count=36,
             started_days_ago=8,
         )
-        result = main.evaluate_result(
-            main.ResultEvaluationRequest(experiment_id=underpowered.experiment_id)
+        underpowered_measurement = main._get_experiment_measurement(
+            self.client_db,
+            underpowered,
         )
+        self.assertEqual(
+            underpowered_measurement["metrics"]["control_customers"],
+            4,
+        )
+        self.assertEqual(
+            underpowered_measurement["metrics"]["treatment_customers"],
+            36,
+        )
+        self.assertEqual(
+            underpowered_measurement["metrics"]["sample_status"],
+            "insufficient_sample",
+        )
+        with patch.object(
+            main,
+            "_request_ai_experiment_evaluation",
+        ) as evaluator:
+            result = main.evaluate_result(
+                main.ResultEvaluationRequest(
+                    experiment_id=underpowered.experiment_id
+                )
+            )
+            evaluator.assert_not_called()
         self.assertEqual(result["experiment_status"], "RUNNING")
+        self.assertEqual(
+            json.loads(result["evaluation"])["decision"],
+            "CONTINUE",
+        )
         self.assertEqual(self.client_db.query(main.LearningRecord).count(), 0)
+
+    def test_real_evaluation_helper_persists_final_evaluation_and_learning(self):
+        opportunity = self.add_opportunity("Increase Average Order Value")
+        experiment = self.add_experiment_with_assignments(
+            opportunity,
+            "Recommend relevant product bundles",
+            control_count=10,
+            treatment_count=10,
+            started_days_ago=8,
+            treatment_margin=25,
+        )
+        gemini_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "decision": "STOP",
+                                "reason": "Deterministic evaluation response.",
+                                "next_action": "Stop this test strategy.",
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=gemini_response,
+        ) as gemini_call:
+            result = main.evaluate_result(
+                main.ResultEvaluationRequest(experiment_id=experiment.experiment_id)
+            )
+
+        self.assertEqual(result["experiment_status"], "STOPPED")
+        gemini_call.assert_called_once()
+        prompt = gemini_call.call_args.kwargs["messages"][0]["content"]
+        self.assertIn("Observed revenue lift vs control:", prompt)
+        self.assertIn("Observed conversion lift in percentage points:", prompt)
+        self.assertIn("Observed margin impact vs control:", prompt)
+
+        persisted_evaluation = (
+            self.client_db.query(main.ExperimentEvaluation)
+            .filter_by(experiment_id=experiment.id)
+            .one()
+        )
+        self.assertEqual(persisted_evaluation.decision, "STOP")
+        self.assertEqual(
+            json.loads(persisted_evaluation.metrics_json)["revenue_growth_percent"],
+            main._get_experiment_measurement(
+                self.client_db,
+                experiment,
+            )["revenue_growth_percent"],
+        )
+        persisted_learning = (
+            self.client_db.query(main.LearningRecord)
+            .filter_by(experiment_id=experiment.id)
+            .one()
+        )
+        self.assertEqual(persisted_learning.evaluation_decision, "STOP")
+        self.assertEqual(persisted_learning.learning_signal, "NEGATIVE")
 
     def test_final_learning_retains_strategy_is_idempotent_and_scoped(self):
         aov = self.add_opportunity("Increase Average Order Value")

@@ -10,7 +10,7 @@ Commerce teams have many possible growth levers, but deciding which opportunity 
 
 GrowthPilot AI combines opportunity detection, Gemini-powered strategy decisions, merchant guardrails, controlled experiments, deterministic measurement, and AI result evaluation in one dashboard. It helps a merchant move from a detected opportunity to a measurable next action without losing control of business constraints.
 
-The current Opportunity Engine V1 analyzes deterministic local commerce records. Its data source can be replaced with a real payment or commerce integration later without changing the detection and scoring service.
+The current Opportunity Engine V1 analyzes local commerce records, including test-mode Razorpay orders and payments mapped to GrowthPilot customers. Seeded demo data remains available for local development.
 
 ## How GrowthPilot AI Works
 
@@ -30,6 +30,8 @@ The Opportunity Engine derives abandoned-cart recovery, repeat-purchase, average
 - AI-powered opportunity strategy decisions
 - Data-driven opportunities with evidence, affected-customer counts, and transparent scores
 - Idempotent local commerce demo-data seeding
+- Razorpay test-mode webhook ingestion for INR payment captures and failures
+- Mapping of Razorpay test orders and verified payments into commerce records
 - Merchant growth goals and constraints
 - Discount and margin guardrails
 - Controlled 90/10 test vs holdout experiments
@@ -48,11 +50,11 @@ Experiment outcomes are calculated from completed orders recorded for assigned c
 ## Persistent Experiment Engine
 
 - An approved opportunity creates a SQLite-backed `RUNNING` experiment with a unique public ID, hypothesis, control/treatment definitions, budget, and merchant guardrail settings.
-- Eligible customers are selected from the existing commerce records for the opportunity type. At least 10 eligible customers are required; a stable SHA-256 ordering assigns approximately 90% to `CONTROL` and 10% to `TREATMENT`. Assignments are stored with a unique experiment/customer constraint and reused on duplicate requests.
+- Eligible customers are selected from the existing commerce records for the opportunity type. Launch is rejected unless the planned 90/10 assignment provides at least 10 customers in each arm; with the current allocator this requires at least 96 eligible customers and produces 86 `CONTROL` / 10 `TREATMENT`. A stable SHA-256 ordering assigns customers, and assignments are stored with a unique experiment/customer constraint and reused on duplicate requests.
 - Experiments can be read with `GET /api/experiment/{experiment_id}` and paused, completed, or stopped with the corresponding `POST /api/experiment/{experiment_id}/pause`, `/complete`, and `/stop` routes.
 - Measurement compares completed, validly paid orders (or completed orders without a separate payment record), converted customers, revenue, average order value, and recorded order margin across assigned groups. Orders before experiment start and orders from unassigned customers are excluded. Relative lift is unavailable when its baseline is zero. Evaluation requires at least 10 assigned customers per variant and a 7-day observation window.
 - Evaluations use persisted experiment metrics, apply the recorded merchant minimum-margin guardrail before Gemini, and persist the decision, reason, next action, and metric snapshot. Underpowered evaluations do not call Gemini.
-- The current commerce source and its seeded records are local synthetic/demo data. A future Razorpay integration can replace that source without changing the strategy and experiment flow.
+- Commerce records can come from the local demo seed or from Razorpay test-mode payments attached to mapped orders. Live Razorpay mode and automatic Razorpay order/checkout creation are not implemented.
 
 ## Autonomous Learning Loop
 
@@ -62,6 +64,25 @@ Experiment outcomes are calculated from completed orders recorded for assigned c
 - `GET /api/learning` returns recent learning records; `GET /api/learning/{opportunity}` returns records only for that URL-encoded opportunity. `/api/strategy` includes only history matching the current opportunity, after its existing discount and margin checks.
 - `POST /api/autopilot/next-action` returns a learning-aware recommendation and history summary. It never creates an experiment, launches a campaign, or sends a message. Experiment creation remains on the existing approved-strategy flow.
 - `GET /api/customers` lists persisted customer IDs. `POST /api/orders` records a locally observed order for an existing customer and optionally its payment event; repeated submissions with the same external order ID are idempotent.
+
+## Test Coverage
+
+- The backend suite currently has **43 passing tests**, including an isolated deterministic Razorpay E2E test for signed webhook ingestion through order mapping, opportunity detection, strategy/guardrails, experiment, measurement, and evaluation persistence. External Razorpay and Gemini calls are not made.
+- A separate regression test exercises the real evaluation helper and verifies persisted evaluation and learning state while mocking only the Gemini response.
+- Experiment launch requires at least 10 customers in each arm of the planned 90/10 assignment; the current allocator needs at least 96 eligible customers.
+
+## Razorpay Test-Mode Integration
+
+The current integration accepts Razorpay test-mode webhooks; it does not create Razorpay orders or initiate checkout. It supports INR `payment.captured` and `payment.failed` events. Live Razorpay payments and checkout are not supported.
+
+1. In `backend/.env`, set `RAZORPAY_MODE=test`, `RAZORPAY_WEBHOOK_SECRET` to the webhook secret configured with Razorpay, and `RAZORPAY_ACCOUNT_REFERENCE` to the Razorpay account ID used by the mapped orders. The webhook's `account_id` is used when present; otherwise the configured account reference is used. `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` are not currently used to call the Razorpay API.
+2. Create or identify an existing GrowthPilot customer using `GET /api/customers`.
+3. Before delivering its webhook, map the Razorpay order to that customer with `POST /api/orders`. Include an internal `external_order_id`, the existing `customer_id`, order amount in rupees, `currency: "INR"`, `provider: "razorpay"`, the matching `provider_account`, and the Razorpay `provider_order_id`. Order mappings must be created in test mode, and one Razorpay order ID cannot map to multiple local orders within the same account.
+4. Configure Razorpay to send payment webhooks to `POST /api/webhooks/razorpay`. The endpoint requires Razorpay's `X-Razorpay-Signature` and `X-Razorpay-Event-Id` headers and verifies the signature against the raw request body. A locally running backend needs a publicly reachable HTTPS endpoint for Razorpay to deliver events.
+
+Verified, supported events update the matching mapped order/payment and are then available to opportunity detection and experiment measurement. Duplicate webhook event IDs are idempotent. Unmapped payments and unsupported events/currencies are recorded with their processing status but do not create commerce orders or payments. Configure the webhook secret privately; do not commit it.
+
+This is an integration foundation for test-mode data ingestion, not a production payment integration: live mode, checkout/order creation, refunds, and other payment event types are not supported.
 
 ## Architecture
 
