@@ -8,7 +8,7 @@ Commerce teams have many possible growth levers, but deciding which opportunity 
 
 ## Solution
 
-GrowthPilot AI combines opportunity detection, Gemini-powered strategy decisions, merchant guardrails, controlled experiments, deterministic measurement, and AI result evaluation in one dashboard. It helps a merchant move from a detected opportunity to a measurable next action without losing control of business constraints.
+GrowthPilot AI combines opportunity detection, Gemini-powered strategy decisions, merchant guardrails, controlled experiments, deterministic measurement, and AI result evaluation in one dashboard. Its autonomous loop coordinates opportunity detection, AI strategy selection, guardrail validation, persistent experimentation, measurement, evaluation, and learning. In this buildathon demo, the merchant explicitly starts an AI decision with **Run AI Decision**, keeping experiment launches under merchant control.
 
 The current Opportunity Engine V1 analyzes local commerce records, including test-mode Razorpay orders and payments mapped to GrowthPilot customers. Seeded demo data remains available for local development.
 
@@ -41,7 +41,7 @@ The Opportunity Engine derives abandoned-cart recovery, repeat-purchase, average
 - Persistent, opportunity-specific learning from finalized experiment outcomes
 - Learning-aware strategy prompts and evidence-based confidence coverage
 - Recommendation-only Autopilot next actions
-- Autopilot dashboard for the growth loop, learning memory, and next actions
+- Autonomous growth-loop dashboard for experiments, learning memory, and next actions; AI decisions require an explicit merchant action
 
 ## Example Results
 
@@ -70,7 +70,7 @@ Experiment outcomes are calculated from completed orders recorded for assigned c
 - The backend suite currently has **44 passing tests**, including an isolated deterministic Razorpay E2E test for signed webhook ingestion through order mapping, opportunity detection, strategy/guardrails, experiment, measurement, and evaluation persistence. External Razorpay and Gemini calls are not made.
 - A separate regression test exercises the real evaluation helper and verifies persisted evaluation and learning state while mocking only the Gemini response.
 - Experiment launch requires at least 10 customers in each arm of the planned 90/10 assignment; the current allocator needs at least 96 eligible customers.
-- To add eligible local AOV demo customers without changing existing data, call `POST /api/demo/seed/extend`. It adds linked completed orders, successful payments, and cart events until at least 120 customers qualify; repeated calls are idempotent. The original `POST /api/demo/seed` behavior is unchanged.
+- To extend local demo data for an AOV experiment, call `POST /api/demo/seed/extend`. It adds linked demo customers, completed orders, successful payments, and cart events until at least 120 customers qualify. Repeated calls are idempotent and do not alter existing experiment history. This is a local demo-data helper, not a production ingestion mechanism. The original `POST /api/demo/seed` behavior is unchanged.
 
 ## Razorpay Test-Mode Integration
 
@@ -141,12 +141,25 @@ growthpilot-ai/
 
 ## Local Setup
 
-Set `GEMINI_API_KEY` in the backend environment before starting the services.
+The backend currently has no dependency lockfile or requirements manifest. Its runtime imports FastAPI, Uvicorn, SQLAlchemy, OpenAI's compatible client, and python-dotenv. Create and activate a virtual environment, then install those runtime dependencies:
 
 ### Backend
 
+From the repository root, in PowerShell:
+
+```powershell
+Set-Location backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install fastapi uvicorn sqlalchemy openai python-dotenv
+Copy-Item .env.example .env
+```
+
+Edit `backend/.env` and set `GEMINI_API_KEY` for AI strategy and evaluation. For optional Razorpay test-mode webhook use, also set the test webhook values described below. Keep secrets private.
+
+Start the backend and run its tests from the `backend` directory:
+
 ```bash
-cd backend
 python -m uvicorn main:app --reload
 ```
 
@@ -155,13 +168,27 @@ Backend URLs:
 - API: http://127.0.0.1:8000
 - Interactive API docs: http://127.0.0.1:8000/docs
 
-Seed the local demo dataset once with:
+Run the backend test suite with:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/api/demo/seed
+python -m unittest discover -s tests
 ```
 
-The endpoint is idempotent: subsequent calls return zero newly created records. The dashboard also offers a seed button when no opportunities are available.
+The currently verified result is **44 tests passing**.
+
+Seed the initial local commerce demo dataset once with:
+
+```bash
+curl.exe -X POST http://127.0.0.1:8000/api/demo/seed
+```
+
+If existing commerce data does not provide enough eligible AOV customers for an experiment, extend local demo data with:
+
+```bash
+curl.exe -X POST http://127.0.0.1:8000/api/demo/seed/extend
+```
+
+The extension endpoint is idempotent and preserves existing commerce records and experiment history. Neither seed endpoint is a production data-ingestion mechanism.
 
 ### Frontend
 
@@ -180,7 +207,7 @@ Frontend URL:
 1. Open the dashboard and review the current growth goal and constraints.
 2. If the opportunity list is empty, seed local demo commerce data from the dashboard or the seed endpoint.
 3. Review the detected opportunities, their evidence, affected population, and score.
-4. Run the AI decision for an opportunity, or use Autopilot to start the loop automatically.
+4. Explicitly click **Run AI Decision** for an opportunity. Autopilot describes the coordinated intelligence and experimentation workflow; the demo does not trigger a strategy or experiment automatically on page load.
 5. Review the AI decision and guardrail outcome.
 6. For an approved opportunity, review the persistent 90/10 experiment, its hypothesis, and assigned-customer counts.
 7. Inspect measurement status and observed control/treatment results. Newly launched experiments may initially show `insufficient_sample`.
@@ -203,6 +230,7 @@ Frontend URL:
 - The dashboard presents the full autonomous loop in a single operator view.
 - Learning Memory contains only persisted, finalized experiment outcomes; paused and underpowered experiments are excluded.
 - The next-action API is recommendation-only and does not represent live campaign execution.
+- Actual campaign execution and production offer delivery are not implemented. The merchant explicitly starts the AI decision; the backend can create a controlled experiment but does not send offers to production customers.
 - The demo seed and customer assignments are deterministic, while experiment outcome values depend on subsequently observed commerce records.
 - A new experiment has no post-start outcomes at launch; demo data should be supplemented with observed orders before presenting performance lift.
 - Use the growth goal controls to demonstrate how merchant constraints remain part of every decision.
