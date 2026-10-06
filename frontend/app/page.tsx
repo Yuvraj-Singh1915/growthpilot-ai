@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 type Opportunity = {
   title: string;
@@ -65,6 +65,8 @@ type MeasurementResult = {
     treatment_conversions?: number;
     control_orders?: number;
     treatment_orders?: number;
+    control_average_order_value?: number | null;
+    treatment_average_order_value?: number | null;
     sample_issues?: string[];
   };
 };
@@ -167,9 +169,20 @@ function parseExperimentEvaluation(
   return undefined;
 }
 
-export default function Home() {
-  const [autopilot, setAutopilot] = useState(true);
+function formatMeasurementStatus(status?: string) {
+  switch (status) {
+    case "insufficient_observation_window":
+      return "Collecting experiment evidence";
+    case "insufficient_sample":
+      return "Insufficient sample";
+    case "sufficient_sample":
+      return "Observation complete";
+    default:
+      return status?.replaceAll("_", " ") || "Waiting for measurement";
+  }
+}
 
+export default function Home() {
   const [goal, setGoal] = useState(15);
   const [maxDiscount, setMaxDiscount] = useState(10);
   const [budget, setBudget] = useState(50000);
@@ -213,13 +226,12 @@ export default function Home() {
   >({});
   const [nextActionErrors, setNextActionErrors] = useState<Record<number, string>>({});
   const [loadingNextAction, setLoadingNextAction] = useState<number | null>(null);
-  const autopilotRunRef = useRef(false);
 
   // ---------------------------------------
   // LOAD OPPORTUNITIES
   // ---------------------------------------
 
-  const loadOpportunities = async () => {
+  const loadOpportunities = useCallback(async () => {
     setLoadingOpportunities(true);
     setOpportunityError("");
 
@@ -259,7 +271,7 @@ export default function Home() {
     } finally {
       setLoadingOpportunities(false);
     }
-  };
+  }, [goal, maxDiscount, budget, minMargin]);
 
   const loadLearningMemory = async () => {
     setLoadingLearning(true);
@@ -328,7 +340,7 @@ export default function Home() {
   useEffect(() => {
     loadOpportunities();
     void loadLearningMemory();
-  }, [goal, maxDiscount, budget, minMargin]);
+  }, [loadOpportunities, goal, maxDiscount, budget, minMargin]);
 
   // ---------------------------------------
   // AI DECISION → EXPERIMENT → MEASUREMENT
@@ -523,17 +535,6 @@ export default function Home() {
     setLoadingEvaluation(null);
   }
 };
-    useEffect(() => {
-    if (
-      autopilot &&
-      opportunities.length > 0 &&
-      !autopilotRunRef.current
-    ) {
-      autopilotRunRef.current = true;
-      void runDecision(0, opportunities[0]);
-    }
-  }, [autopilot, opportunities]);
-
   // ---------------------------------------
   // LAST MEASUREMENT RESULT
   // ---------------------------------------
@@ -556,7 +557,34 @@ export default function Home() {
       ? measurementResults[lastMeasurementIndex]
       : null;
 
+  const isWaitingForObservation =
+    !lastMeasurement ||
+    lastMeasurement.metrics?.sample_status ===
+      "insufficient_observation_window";
+  const waitingForObservationCopy =
+    "No observed results yet. GrowthPilot evaluates the experiment only after the observation window is complete.";
+  const observedRevenueValue =
+    !isWaitingForObservation && lastMeasurement?.incremental_revenue != null
+      ? `₹${lastMeasurement.incremental_revenue.toLocaleString("en-IN")}`
+      : isWaitingForObservation
+        ? "Awaiting observed experiment data"
+        : "Not enough data";
+  const observedConversionValue =
+    !isWaitingForObservation && lastMeasurement?.conversion_lift != null
+      ? `${lastMeasurement.conversion_lift > 0 ? "+" : ""}${lastMeasurement.conversion_lift} pp`
+      : isWaitingForObservation
+        ? "Awaiting observed experiment data"
+        : "Not enough data";
+  const observedAovValue =
+    !isWaitingForObservation &&
+    lastMeasurement?.metrics?.treatment_average_order_value != null
+      ? `₹${lastMeasurement.metrics.treatment_average_order_value.toLocaleString("en-IN")}`
+      : isWaitingForObservation
+        ? "Awaiting observed experiment data"
+        : "Not enough data";
+
   const goalProgress =
+    !isWaitingForObservation &&
     lastMeasurement?.revenue_growth_percent !== null &&
     lastMeasurement?.revenue_growth_percent !== undefined
     ? Math.min(
@@ -571,6 +599,9 @@ export default function Home() {
         (record) => record.experiment_id === experimentResults[0].experiment_id
       )
     : undefined;
+  const autopilotEvaluation = parseExperimentEvaluation(
+    evaluationResults[0]?.evaluation
+  );
 
   return (
     <main className="min-h-screen bg-slate-950 text-white">
@@ -578,35 +609,29 @@ export default function Home() {
           HEADER
       --------------------------------------- */}
 
-      <header className="border-b border-slate-800 bg-slate-950/90 px-6 py-4">
-        <div className="mx-auto flex max-w-7xl items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight">
+      <header className="border-b border-slate-800 bg-slate-950/90 px-4 py-4 sm:px-6">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-3">
+          <div className="min-w-0">
+            <h1 className="whitespace-nowrap text-lg font-bold tracking-tight sm:text-2xl">
               GrowthPilot{" "}
               <span className="text-blue-400">
                 AI
               </span>
             </h1>
 
-            <p className="text-sm text-slate-400">
+            <p className="text-xs text-slate-400 sm:text-sm">
               Autonomous Commerce Growth Engine
             </p>
           </div>
 
-          <button
-            onClick={() =>
-              setAutopilot(!autopilot)
-            }
-            className={`rounded-full px-5 py-2 text-sm font-semibold transition ${
-              autopilot
-                ? "bg-green-500 text-black"
-                : "bg-slate-700 text-white"
-            }`}
-          >
-            {autopilot
-              ? "● AUTOPILOT ON"
-              : "○ AUTOPILOT OFF"}
-          </button>
+          <div className="shrink-0 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-2 text-right sm:px-3">
+            <p className="whitespace-nowrap text-[10px] font-semibold text-emerald-300 sm:text-sm">
+              AUTOPILOT READY
+            </p>
+            <p className="whitespace-nowrap text-[9px] text-slate-400 sm:text-xs">
+              Manual launch
+            </p>
+          </div>
         </div>
       </header>
 
@@ -614,7 +639,7 @@ export default function Home() {
           MAIN CONTENT
       --------------------------------------- */}
 
-      <section className="mx-auto max-w-7xl px-6 py-8">
+      <section className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 sm:py-8">
 
         {/* WELCOME */}
 
@@ -623,7 +648,7 @@ export default function Home() {
             AI GROWTH COMMAND CENTER
           </p>
 
-          <h2 className="mt-2 text-4xl font-bold">
+          <h2 className="mt-2 text-3xl font-bold sm:text-4xl">
             Grow your revenue intelligently.
           </h2>
 
@@ -810,30 +835,45 @@ export default function Home() {
             METRICS
         --------------------------------------- */}
 
-        <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-4">
+        <div className="grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-4">
 
           <MetricCard
             title="Observed Revenue"
-            value="Unavailable"
-            change="No measured experiment"
+            value={observedRevenueValue}
+            change={
+              isWaitingForObservation
+                ? waitingForObservationCopy
+                : "Measured incremental revenue"
+            }
+            waiting={isWaitingForObservation}
           />
 
           <MetricCard
             title="Observed Conversion"
-            value="Unavailable"
-            change="No measured experiment"
+            value={observedConversionValue}
+            change={
+              isWaitingForObservation
+                ? waitingForObservationCopy
+                : "Treatment conversion lift"
+            }
+            waiting={isWaitingForObservation}
           />
 
           <MetricCard
             title="Observed Average Order Value"
-            value="Unavailable"
-            change="No measured experiment"
+            value={observedAovValue}
+            change={
+              isWaitingForObservation
+                ? waitingForObservationCopy
+                : "Treatment average order value"
+            }
+            waiting={isWaitingForObservation}
           />
 
           <MetricCard
             title="Observed Cart Recovery"
-            value="Unavailable"
-            change="No measured experiment"
+            value="Not measured"
+            change="No cart-recovery experiment measurement is available."
           />
 
         </div>
@@ -842,7 +882,7 @@ export default function Home() {
             AUTONOMOUS GROWTH LOOP
         --------------------------------------- */}
 
-        <div className="mt-8 rounded-2xl border border-purple-500/20 bg-gradient-to-r from-slate-900 via-slate-900 to-purple-950/40 p-6">
+        <div className="mt-8 rounded-2xl border border-purple-500/20 bg-gradient-to-r from-slate-900 via-slate-900 to-purple-950/40 p-4 sm:p-6">
           <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
             <div>
               <p className="text-sm font-medium text-purple-400">
@@ -857,7 +897,7 @@ export default function Home() {
             </p>
           </div>
 
-          <div className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-9">
+          <div className="mt-6 grid min-w-0 grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-9">
             {[
               ["01", "Commerce", "Data Analysis", "text-slate-300"],
               ["02", "Opportunity", "Detection", "text-blue-400"],
@@ -869,10 +909,10 @@ export default function Home() {
               ["08", "Learning", "Memory", "text-amber-400"],
               ["09", "Next Best", "Recommendation", "text-emerald-400"],
             ].map(([step, label, detail, color], index) => (
-              <div key={step} className="relative rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+              <div key={step} className="relative min-w-0 rounded-xl border border-slate-800 bg-slate-950/70 p-3 sm:p-4">
                 <p className={`text-xs font-semibold ${color}`}>{step}</p>
-                <p className="mt-3 text-sm font-semibold text-white">{label}</p>
-                <p className="text-xs text-slate-400">{detail}</p>
+                <p className="mt-3 break-words text-sm font-semibold text-white">{label}</p>
+                <p className="break-words text-xs text-slate-400">{detail}</p>
                 {index < 8 && (
                   <span className="absolute -right-3 top-1/2 z-10 hidden -translate-y-1/2 text-slate-600 xl:block">
                     →
@@ -900,7 +940,12 @@ export default function Home() {
             <p className="mt-5 text-sm text-red-300">{learningError}</p>
           ) : learningRecords.length === 0 ? (
             <p className="mt-5 text-sm text-slate-400">
-              No completed experiment has produced reusable learning yet. Underpowered or paused experiments are not stored as outcomes.
+              <span className="block font-medium text-slate-200">
+                No learning recorded yet
+              </span>
+              <span className="mt-1 block">
+                Learning is stored only after an experiment has been evaluated.
+              </span>
             </p>
           ) : (
             <div className="mt-5 grid gap-3 lg:grid-cols-2">
@@ -922,7 +967,7 @@ export default function Home() {
                     Original strategy: {record.original_strategy_action || "Unavailable"}
                   </p>
                   <p className="mt-1 text-xs text-slate-500">{record.hypothesis}</p>
-                  <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
+                  <div className="mt-3 grid grid-cols-1 gap-2 text-xs sm:grid-cols-3">
                     <p className="text-slate-400">
                       Revenue growth{" "}
                       <span className="block font-semibold text-white">
@@ -989,8 +1034,8 @@ export default function Home() {
                 </h3>
               </div>
 
-              <span className="rounded-full bg-green-500/10 px-3 py-1 text-xs font-medium text-green-400">
-                LIVE ANALYSIS
+              <span className="rounded-full border border-slate-700 bg-slate-800/70 px-3 py-1 text-center text-xs font-medium text-slate-300">
+                Commerce data analysis
               </span>
 
             </div>
@@ -1011,31 +1056,31 @@ export default function Home() {
 
                     <div
                       key={index}
-                      className="rounded-xl border border-slate-800 bg-gradient-to-br from-slate-950 to-slate-900 p-5 shadow-lg shadow-black/10"
+                      className="min-w-0 rounded-xl border border-slate-800 bg-gradient-to-br from-slate-950 to-slate-900 p-4 shadow-lg shadow-black/10 sm:p-5"
                     >
 
-                      <div className="flex items-start justify-between gap-4">
+                      <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
 
-                        <div className="flex-1">
+                        <div className="min-w-0 flex-1">
 
-                          <div className="flex items-center justify-between">
+                          <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
 
-                            <div>
-                              <p className="text-lg font-bold tracking-tight text-white">
+                            <div className="min-w-0">
+                              <p className="break-words text-lg font-bold tracking-tight text-white">
                                 {item.title}
                               </p>
 
-                              <p className="mt-2 max-w-xl text-sm leading-6 text-slate-300">
+                              <p className="mt-2 max-w-xl break-words text-sm leading-6 text-slate-300">
                                 {item.recommended_action}
                               </p>
                               {item.evidence && (
-                                <p className="mt-2 max-w-xl text-xs leading-5 text-slate-500">
+                                <p className="mt-2 max-w-xl break-words text-xs leading-5 text-slate-500">
                                   {item.evidence}
                                 </p>
                               )}
                             </div>
 
-                            <span className="shrink-0 rounded-full border border-blue-400/20 bg-blue-500/10 px-3 py-1 text-xs font-semibold text-blue-400">
+                            <span className="w-fit shrink-0 rounded-full border border-blue-400/20 bg-blue-500/10 px-3 py-1 text-xs font-semibold text-blue-400">
                               {item.priority}
                             </span>
 
@@ -1047,7 +1092,7 @@ export default function Home() {
                               Estimated Potential Revenue
                             </p>
 
-                            <p className="mt-1 text-2xl font-bold tracking-tight text-green-400">
+                            <p className="mt-1 break-words text-2xl font-bold tracking-tight text-green-400">
                               ₹
                               {item.potential_revenue.toLocaleString(
                                 "en-IN"
@@ -1080,7 +1125,7 @@ export default function Home() {
                               loadingDecision ===
                               index
                             }
-                            className="mt-4 w-full rounded-lg bg-blue-600 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-blue-950/30 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+                            className="mt-4 w-full whitespace-normal break-words rounded-lg bg-blue-600 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-blue-950/30 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             {loadingDecision ===
                             index
@@ -1096,7 +1141,7 @@ export default function Home() {
                           <button
                             onClick={() => void requestNextAction(index, item)}
                             disabled={loadingNextAction === index}
-                            className="mt-2 w-full rounded-lg border border-purple-500/30 bg-purple-500/10 px-4 py-2.5 text-sm font-semibold text-purple-200 transition hover:bg-purple-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                            className="mt-2 w-full whitespace-normal break-words rounded-lg border border-purple-500/30 bg-purple-500/10 px-4 py-2.5 text-sm font-semibold text-purple-200 transition hover:bg-purple-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             {loadingNextAction === index
                               ? "Reviewing learning..."
@@ -1161,19 +1206,23 @@ export default function Home() {
                           {decisionResults[
                             index
                           ] && (
-                            <div className="mt-4 rounded-lg border border-slate-700 bg-slate-900 p-4">
+                            <div className="mt-4 min-w-0 rounded-lg border border-slate-700 bg-slate-900 p-4">
 
-                              <p className="text-sm text-slate-400">
+                              <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
                                 AI Decision
                               </p>
 
-                              <p className="mt-1 text-lg font-bold">
+                              <span className={`mt-2 inline-flex rounded-full px-3 py-1 text-sm font-bold ${
+                                decisionResults[index].decision === "APPROVE"
+                                  ? "bg-emerald-500/10 text-emerald-300"
+                                  : "bg-amber-500/10 text-amber-300"
+                              }`}>
                                 {
                                   decisionResults[
                                     index
                                   ].decision
                                 }
-                              </p>
+                              </span>
 
                               <p className="mt-2 text-sm text-slate-400">
                                 Risk:{" "}
@@ -1258,7 +1307,7 @@ export default function Home() {
                                   return (
                                     <div className="mt-4 border-t border-slate-800 pt-4">
                                       <p className="text-sm font-semibold text-purple-400">
-                                        🤖 AI Result Evaluation
+                                        AI Result Evaluation
                                       </p>
 
                                       <div className="mt-3 space-y-3 text-sm">
@@ -1266,16 +1315,29 @@ export default function Home() {
                                           <p className="text-slate-500">
                                             Decision
                                           </p>
-                                          <p className="font-semibold">
+                                          <p className={`mt-1 inline-flex rounded-full px-3 py-1 font-semibold ${
+                                            evaluation?.decision === "CONTINUE"
+                                              ? "bg-amber-500/10 text-amber-300"
+                                              : evaluation?.decision === "STOP"
+                                                ? "bg-rose-500/10 text-rose-300"
+                                                : "bg-emerald-500/10 text-emerald-300"
+                                          }`}>
                                             {evaluation?.decision}
                                           </p>
+                                          {evaluation?.decision === "CONTINUE" && (
+                                            <p className="mt-2 break-words text-slate-400">
+                                              {evaluation.reason?.includes("7-day observation window")
+                                                ? "The observation window is not complete, so GrowthPilot is continuing to observe rather than declaring a winner."
+                                                : "The experiment is continuing; no final winner has been declared."}
+                                            </p>
+                                          )}
                                         </div>
 
                                         <div>
                                           <p className="text-slate-500">
                                             Reason
                                           </p>
-                                          <p className="font-semibold">
+                                          <p className="break-words font-semibold">
                                             {evaluation?.reason}
                                           </p>
                                         </div>
@@ -1284,7 +1346,7 @@ export default function Home() {
                                           <p className="text-slate-500">
                                             Next Action
                                           </p>
-                                          <p className="font-semibold">
+                                          <p className="break-words font-semibold">
                                             {evaluation?.next_action}
                                           </p>
                                         </div>
@@ -1303,21 +1365,33 @@ export default function Home() {
                           {experimentResults[
                             index
                           ] && (
-                            <div className="mt-4 rounded-lg border border-green-500/20 bg-green-500/5 p-4">
+                            <div className="mt-4 min-w-0 rounded-lg border border-green-500/20 bg-green-500/5 p-4">
 
                               <p className="text-sm font-semibold text-green-400">
-                                🚀 Experiment{" "}
-                                {experimentResults[index].experiment_status ||
-                                  "Launched"}
+                                Experiment
                               </p>
 
-                              <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                <span className="rounded-full bg-emerald-500/10 px-3 py-1 text-xs font-semibold text-emerald-300">
+                                  {experimentResults[index].experiment_status ||
+                                    "Launched"}
+                                </span>
+                                {measurementResults[index] && (
+                                  <span className="rounded-full bg-cyan-500/10 px-3 py-1 text-xs font-semibold text-cyan-200">
+                                    {formatMeasurementStatus(
+                                      measurementResults[index].metrics?.sample_status
+                                    )}
+                                  </span>
+                                )}
+                              </div>
 
-                                <div>
+                              <div className="mt-3 grid min-w-0 grid-cols-1 gap-3 text-sm sm:grid-cols-2">
+
+                                <div className="min-w-0">
                                   <p className="text-slate-500">
                                     Treatment
                                   </p>
-                                  <p className="font-semibold">
+                                  <p className="break-words font-semibold">
                                     {
                                       experimentResults[
                                         index
@@ -1327,11 +1401,11 @@ export default function Home() {
                                   </p>
                                 </div>
 
-                                <div>
+                                <div className="min-w-0">
                                   <p className="text-slate-500">
                                     Control / Holdout
                                   </p>
-                                  <p className="font-semibold">
+                                  <p className="break-words font-semibold">
                                     {
                                       experimentResults[
                                         index
@@ -1341,11 +1415,11 @@ export default function Home() {
                                   </p>
                                 </div>
 
-                                <div>
+                                <div className="min-w-0">
                                   <p className="text-slate-500">
                                     Status
                                   </p>
-                                  <p className="font-semibold text-green-400">
+                                  <p className="break-words font-semibold text-green-400">
                                     {
                                       experimentResults[index]
                                         .experiment_status ||
@@ -1354,11 +1428,11 @@ export default function Home() {
                                   </p>
                                 </div>
 
-                                <div>
+                                <div className="min-w-0">
                                   <p className="text-slate-500">
                                     Experiment ID
                                   </p>
-                                  <p className="font-semibold">
+                                  <p className="break-all font-semibold">
                                     {
                                       experimentResults[
                                         index
@@ -1368,11 +1442,11 @@ export default function Home() {
                                   </p>
                                 </div>
 
-                                <div>
+                                <div className="min-w-0">
                                   <p className="text-slate-500">
                                     Assigned Customers
                                   </p>
-                                  <p className="font-semibold">
+                                  <p className="break-words font-semibold">
                                     {experimentResults[index]
                                       .assigned_customers?.treatment ?? 0}{" "}
                                     treatment /{" "}
@@ -1382,25 +1456,24 @@ export default function Home() {
                                   </p>
                                 </div>
 
-                                <div>
+                                <div className="min-w-0">
                                   <p className="text-slate-500">
                                     Measurement Status
                                   </p>
-                                  <p className="font-semibold">
-                                    {measurementResults[index]?.metrics
-                                      ?.sample_status ||
-                                      experimentResults[index]
-                                        .measurement_status ||
-                                      "Pending"}
+                                  <p className="mt-1 break-words font-semibold text-cyan-200">
+                                    {formatMeasurementStatus(
+                                      measurementResults[index]?.metrics?.sample_status ||
+                                        experimentResults[index].measurement_status
+                                    )}
                                   </p>
                                 </div>
 
                                 {experimentResults[index].started_at && (
-                                  <div>
+                                  <div className="min-w-0">
                                     <p className="text-slate-500">
                                       Started
                                     </p>
-                                    <p className="font-semibold">
+                                    <p className="break-words font-semibold">
                                       {new Date(
                                         experimentResults[index].started_at!
                                       ).toLocaleString()}
@@ -1428,18 +1501,32 @@ export default function Home() {
                               ] && (
                                 <div className="mt-4 border-t border-slate-800 pt-4">
 
-                                  <p className="text-sm font-semibold text-blue-400">
+                                  <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <p className="text-sm font-semibold text-blue-300">
                                     Measurement
-                                  </p>
+                                    </p>
+                                    {measurementResults[index].metrics?.sample_status ===
+                                      "insufficient_observation_window" && (
+                                      <span className="rounded-full bg-amber-500/10 px-3 py-1 text-xs font-semibold text-amber-300">
+                                        Collecting experiment evidence
+                                      </span>
+                                    )}
+                                  </div>
+                                  {measurementResults[index].metrics?.sample_status ===
+                                    "insufficient_observation_window" && (
+                                    <p className="mt-2 text-sm text-slate-400">
+                                      Waiting for the observation window to complete.
+                                    </p>
+                                  )}
 
-                                  <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+                                  <div className="mt-3 grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
 
-                                    <div>
+                                    <div className="min-w-0">
                                       <p className="text-xs text-slate-500">
                                         Incremental Revenue
                                       </p>
 
-                                      <p className="mt-1 font-bold text-green-400">
+                                      <p className="mt-1 break-words font-bold text-green-400">
                                         {measurementResults[index]
                                           .incremental_revenue === null
                                           ? "Insufficient data"
@@ -1451,12 +1538,12 @@ export default function Home() {
                                       </p>
                                     </div>
 
-                                    <div>
+                                    <div className="min-w-0">
                                       <p className="text-xs text-slate-500">
                                         Revenue Growth
                                       </p>
 
-                                      <p className="mt-1 font-bold">
+                                      <p className="mt-1 break-words font-bold">
                                         {measurementResults[index]
                                           .revenue_growth_percent === null
                                           ? "Insufficient data"
@@ -1472,12 +1559,12 @@ export default function Home() {
                                       </p>
                                     </div>
 
-                                    <div>
+                                    <div className="min-w-0">
                                       <p className="text-xs text-slate-500">
                                         Conversion Lift
                                       </p>
 
-                                      <p className="mt-1 font-bold">
+                                      <p className="mt-1 break-words font-bold">
                                         {measurementResults[index]
                                           .conversion_lift === null
                                           ? "Insufficient data"
@@ -1493,12 +1580,12 @@ export default function Home() {
                                       </p>
                                     </div>
 
-                                    <div>
+                                    <div className="min-w-0">
                                       <p className="text-xs text-slate-500">
                                         Margin Change
                                       </p>
 
-                                      <p className="mt-1 font-bold">
+                                      <p className="mt-1 break-words font-bold">
                                         {measurementResults[index]
                                           .margin_change === null
                                           ? "Insufficient data"
@@ -1517,8 +1604,8 @@ export default function Home() {
                                     {measurementResults[index].metrics
                                       ?.sample_status ===
                                       "insufficient_sample" && (
-                                      <p className="mt-3 text-xs text-yellow-400">
-                                        More observation is needed:{" "}
+                                      <p className="mt-3 break-words text-xs text-amber-300">
+                                        More assigned customers are needed:{" "}
                                         {measurementResults[index].metrics
                                           ?.sample_issues?.join("; ") ||
                                           "collect additional experiment data"}
@@ -1603,7 +1690,7 @@ export default function Home() {
           <div className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
 
             <p className="text-sm text-purple-400">
-              AI AUTOPILOT
+              AUTOPILOT WORKFLOW
             </p>
 
             <h3 className="mt-1 text-xl font-bold">
@@ -1647,10 +1734,16 @@ export default function Home() {
                 title="Guardrails"
                 text={
                   decisionResults[0]
-                    ? `Safety checks applied to ${decisionResults[0].decision}`
+                    ? decisionResults[0].decision === "APPROVE"
+                      ? "Merchant constraints passed"
+                      : "Strategy not approved for launch"
                     : "Waiting for strategy checks"
                 }
-                done={!!decisionResults[0]}
+                done={decisionResults[0]?.decision === "APPROVE"}
+                warning={
+                  !!decisionResults[0] &&
+                  decisionResults[0].decision !== "APPROVE"
+                }
                 active={loadingDecision === 0 && !decisionResults[0]}
               />
 
@@ -1676,21 +1769,31 @@ export default function Home() {
                 title="Measurement"
                 text={
                   measurementResults[0]
-                    ? measurementResults[0].metrics?.sample_status ||
-                      "Observed metrics returned"
+                    ? formatMeasurementStatus(
+                        measurementResults[0].metrics?.sample_status
+                      )
                     : "Waiting for experiment measurement"
                 }
                 done={!!measurementResults[0]}
+                active={
+                  measurementResults[0]?.metrics?.sample_status ===
+                  "insufficient_observation_window"
+                }
               />
 
               <Status
                 title="AI Evaluation"
                 text={
-                  evaluationResults[0]
-                    ? "Experiment result evaluated"
+                  loadingEvaluation === 0
+                    ? "Evaluating observed results"
+                    : autopilotEvaluation?.decision
+                    ? `Evaluation: ${autopilotEvaluation.decision}`
                     : "Waiting for sufficient observed results"
                 }
-                done={!!evaluationResults[0]}
+                done={autopilotEvaluation?.decision === "STOP" ||
+                  autopilotEvaluation?.decision === "OPTIMIZE"}
+                warning={autopilotEvaluation?.decision === "CONTINUE"}
+                active={loadingEvaluation === 0}
               />
 
               <Status
@@ -1698,7 +1801,7 @@ export default function Home() {
                 text={
                   autopilotLearningRecord
                     ? `${autopilotLearningRecord.learning_signal} signal stored`
-                    : "No finalized learning for this run"
+                    : "No learning recorded for this run"
                 }
                 done={!!autopilotLearningRecord}
               />
@@ -1754,9 +1857,17 @@ export default function Home() {
                 text={`Minimum margin requirement: ${minMargin}%`}
               />
 
-              <Check
-                text="Inventory verification: not available"
-              />
+              <div className="flex min-w-0 gap-3 text-sm">
+                <span className="mt-0.5 h-2.5 w-2.5 shrink-0 rounded-full bg-slate-500" />
+                <div className="min-w-0">
+                  <p className="font-medium text-slate-300">
+                    Inventory data unavailable
+                  </p>
+                  <p className="mt-1 break-words text-xs text-slate-500">
+                    No inventory integration is connected.
+                  </p>
+                </div>
+              </div>
 
             </div>
 
@@ -1782,11 +1893,12 @@ export default function Home() {
                   Revenue Growth
                 </span>
 
-                <span className="font-bold text-green-400">
-                  {lastMeasurement?.revenue_growth_percent !== null &&
+                <span className="max-w-[55%] text-right font-bold text-green-400">
+                  {!isWaitingForObservation &&
+                  lastMeasurement?.revenue_growth_percent !== null &&
                   lastMeasurement?.revenue_growth_percent !== undefined
                     ? `+${lastMeasurement.revenue_growth_percent}%`
-                    : "Awaiting data"}{" "}
+                    : "Awaiting observed data"}{" "}
                   / {goal}%
                 </span>
 
@@ -1805,12 +1917,13 @@ export default function Home() {
 
               <p className="mt-4 text-sm text-slate-400">
 
-                {lastMeasurement?.revenue_growth_percent !== null &&
+                {!isWaitingForObservation &&
+                lastMeasurement?.revenue_growth_percent !== null &&
                 lastMeasurement?.revenue_growth_percent !== undefined
                   ? lastMeasurement.revenue_growth_percent >= goal
                     ? "🎯 Revenue growth goal achieved. AI can continue optimizing the winning strategy."
                     : "AI is measuring campaign performance and working toward the merchant growth target."
-                  : "Not enough observed experiment data is available to report revenue growth yet."}
+                  : waitingForObservationCopy}
 
               </p>
 
@@ -1834,25 +1947,29 @@ function MetricCard({
   title,
   value,
   change,
+  waiting = false,
 }: {
   title: string;
   value: string;
   change: string;
+  waiting?: boolean;
 }) {
   return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5">
+    <div className="min-w-0 rounded-2xl border border-slate-800 bg-slate-900 p-4 sm:p-5">
 
-      <p className="text-sm text-slate-400">
+      <p className="break-words text-sm text-slate-400">
         {title}
       </p>
 
-      <div className="mt-2 flex items-end justify-between">
+      <div className="mt-3 flex min-w-0 flex-col items-start gap-2">
 
-        <h3 className="text-2xl font-bold">
+        <h3 className={`max-w-full break-words text-xl font-bold leading-tight sm:text-2xl ${
+          waiting ? "text-amber-200" : "text-white"
+        }`}>
           {value}
         </h3>
 
-        <span className="text-sm font-semibold text-slate-500">
+        <span className="max-w-full break-words text-xs leading-5 text-slate-400 sm:text-sm">
           {change}
         </span>
 
@@ -1871,11 +1988,13 @@ function Status({
   text,
   done,
   active,
+  warning,
 }: {
   title: string;
   text: string;
   done?: boolean;
   active?: boolean;
+  warning?: boolean;
 }) {
   return (
     <div className="flex gap-3">
@@ -1884,6 +2003,8 @@ function Status({
         className={`mt-1 h-3 w-3 rounded-full ${
           done
             ? "bg-green-400"
+            : warning
+            ? "bg-amber-400"
             : active
             ? "animate-pulse bg-blue-400"
             : "bg-slate-600"
