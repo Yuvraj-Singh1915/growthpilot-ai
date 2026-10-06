@@ -660,11 +660,98 @@ def seed_demo_commerce_data(db):
     }
 
 
+def extend_demo_commerce_data(db, target_eligible_customers=120):
+    def eligible_aov_customers():
+        customer_ids, orders, payments = _commerce_intelligence_inputs(db)
+        return get_eligible_customers(
+            opportunity_title="Increase Average Order Value",
+            customer_ids=customer_ids,
+            orders=orders,
+            cart_events=[],
+            payments=payments,
+        )
+
+    initial_eligible_count = len(eligible_aov_customers())
+    customers_to_create = max(0, target_eligible_customers - initial_eligible_count)
+    customers = [
+        Customer(created_at=datetime.utcnow() - timedelta(days=index % 30))
+        for index in range(customers_to_create)
+    ]
+    db.add_all(customers)
+    db.flush()
+
+    orders = []
+    cart_events = []
+    payments = []
+    for index, customer in enumerate(customers):
+        amount = 1200 + (index % 5) * 150
+        order_created_at = datetime.utcnow() - timedelta(days=120 + index % 20)
+        cart_events.append(
+            CartEvent(
+                customer_id=customer.id,
+                cart_value=amount,
+                event_type="cart_created",
+                created_at=order_created_at - timedelta(days=1),
+            )
+        )
+        order = Order(
+            customer_id=customer.id,
+            amount=amount,
+            status="completed",
+            margin_percent=25,
+            external_order_id=f"growthpilot-demo-aov-extension-{customer.id}",
+            created_at=order_created_at,
+        )
+        orders.append(order)
+
+    db.add_all(cart_events + orders)
+    db.flush()
+    payments.extend(
+        Payment(
+            order_id=order.id,
+            status="succeeded",
+            amount=order.amount,
+            created_at=order.created_at,
+        )
+        for order in orders
+    )
+    db.add_all(payments)
+    db.commit()
+
+    eligible_count = len(eligible_aov_customers())
+    return {
+        "status": "success",
+        "customers_created": len(customers),
+        "orders_created": len(orders),
+        "carts_created": len(cart_events),
+        "payments_created": len(payments),
+        "eligible_customers": eligible_count,
+        "target_eligible_customers": target_eligible_customers,
+        "message": (
+            "Demo commerce data was extended with eligible AOV customers."
+            if customers
+            else "The eligible AOV customer target is already met; no additional demo records were created."
+        ),
+    }
+
+
 @app.post("/api/demo/seed")
 def seed_demo_data():
     db = SessionLocal()
     try:
         return seed_demo_commerce_data(db)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@app.post("/api/demo/seed/extend")
+def extend_demo_data():
+    db = SessionLocal()
+    try:
+        return extend_demo_commerce_data(db)
     except Exception:
         db.rollback()
         raise

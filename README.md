@@ -67,9 +67,10 @@ Experiment outcomes are calculated from completed orders recorded for assigned c
 
 ## Test Coverage
 
-- The backend suite currently has **43 passing tests**, including an isolated deterministic Razorpay E2E test for signed webhook ingestion through order mapping, opportunity detection, strategy/guardrails, experiment, measurement, and evaluation persistence. External Razorpay and Gemini calls are not made.
+- The backend suite currently has **44 passing tests**, including an isolated deterministic Razorpay E2E test for signed webhook ingestion through order mapping, opportunity detection, strategy/guardrails, experiment, measurement, and evaluation persistence. External Razorpay and Gemini calls are not made.
 - A separate regression test exercises the real evaluation helper and verifies persisted evaluation and learning state while mocking only the Gemini response.
 - Experiment launch requires at least 10 customers in each arm of the planned 90/10 assignment; the current allocator needs at least 96 eligible customers.
+- To add eligible local AOV demo customers without changing existing data, call `POST /api/demo/seed/extend`. It adds linked completed orders, successful payments, and cart events until at least 120 customers qualify; repeated calls are idempotent. The original `POST /api/demo/seed` behavior is unchanged.
 
 ## Razorpay Test-Mode Integration
 

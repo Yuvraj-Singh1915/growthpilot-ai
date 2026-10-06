@@ -22,6 +22,7 @@ from services.experiment_engine import (
     CommerceOrder,
     CommercePayment,
     assign_variants,
+    get_eligible_customers,
 )
 from services.learning_engine import build_learning_evidence
 from services.opportunity_engine import detect_opportunities
@@ -987,6 +988,111 @@ class LearningLoopTests(unittest.TestCase):
         )
         self.assertEqual(len(detected["opportunities"]), 5)
 
+    def test_demo_extension_is_idempotent_preserves_history_and_enables_launch(self):
+        seeded = main.seed_demo_data()
+        self.assertEqual(seeded["customers_created"], 60)
+        opportunity = self.add_opportunity("Increase Average Order Value")
+        legacy_experiment = self.add_experiment_with_assignments(
+            opportunity,
+            "Existing strategy that must remain unchanged",
+            control_count=4,
+            treatment_count=36,
+            started_days_ago=8,
+            treatment_margin=25,
+        )
+        self.client_db.add(
+            main.ExperimentEvaluation(
+                experiment_id=legacy_experiment.id,
+                decision="CONTINUE",
+                reason="Existing evaluation",
+                next_action="Keep observing",
+                metrics_json="{}",
+            )
+        )
+        self.client_db.add(
+            main.LearningRecord(
+                experiment_id=legacy_experiment.id,
+                opportunity_title=legacy_experiment.opportunity_title,
+                experiment_status=legacy_experiment.status,
+                hypothesis=legacy_experiment.hypothesis,
+                evaluation_decision="CONTINUE",
+                evaluation_reason="Existing learning",
+                next_action="Keep observing",
+                recommended_action_code="existing.strategy",
+                learning_signal="OPTIMIZE",
+                signal_reason="Existing signal",
+                confidence=0.5,
+                confidence_basis="Existing evidence",
+                metrics_json="{}",
+            )
+        )
+        self.client_db.commit()
+
+        def snapshot(model):
+            return [
+                tuple(getattr(row, column.name) for column in model.__table__.columns)
+                for row in self.client_db.query(model).order_by(model.id).all()
+            ]
+
+        existing_snapshot = {
+            model: snapshot(model)
+            for model in (
+                main.Customer,
+                main.Order,
+                main.CartEvent,
+                main.Payment,
+                main.Experiment,
+                main.ExperimentAssignment,
+                main.ExperimentEvaluation,
+                main.LearningRecord,
+            )
+        }
+
+        first = main.extend_demo_data()
+        self.assertGreater(first["customers_created"], 0)
+        self.assertGreaterEqual(first["eligible_customers"], 120)
+        self.assertEqual(first["customers_created"], first["orders_created"])
+        self.assertEqual(first["customers_created"], first["payments_created"])
+        self.assertEqual(first["customers_created"], first["carts_created"])
+
+        append_only_models = {
+            main.Customer,
+            main.Order,
+            main.CartEvent,
+            main.Payment,
+        }
+        for model, expected_rows in existing_snapshot.items():
+            actual_rows = snapshot(model)
+            if model in append_only_models:
+                actual_rows = actual_rows[: len(expected_rows)]
+            self.assertEqual(actual_rows, expected_rows, model.__tablename__)
+
+        aov_eligible_ids, orders, payments = main._commerce_intelligence_inputs(
+            self.client_db
+        )
+        eligible_ids = get_eligible_customers(
+            "Increase Average Order Value",
+            aov_eligible_ids,
+            orders,
+            [],
+            payments,
+        )
+        launched = self.create_approved_experiment(
+            opportunity.title,
+            "A new demo extension experiment strategy",
+        )
+        self.assertEqual(launched["status"], "launched")
+        self.assertGreaterEqual(launched["assigned_customers"]["control"], 10)
+        self.assertGreaterEqual(launched["assigned_customers"]["treatment"], 10)
+        self.assertGreaterEqual(len(eligible_ids), 120)
+
+        second = main.extend_demo_data()
+        self.assertEqual(second["customers_created"], 0)
+        self.assertEqual(second["orders_created"], 0)
+        self.assertEqual(second["carts_created"], 0)
+        self.assertEqual(second["payments_created"], 0)
+        self.assertEqual(second["eligible_customers"], first["eligible_customers"])
+
     def test_required_routes_are_registered(self):
         routes = {
             (method, route.path)
@@ -995,6 +1101,7 @@ class LearningLoopTests(unittest.TestCase):
         }
         expected = {
             ("POST", "/api/demo/seed"),
+            ("POST", "/api/demo/seed/extend"),
             ("POST", "/api/opportunities"),
             ("GET", "/api/opportunities"),
             ("POST", "/api/strategy"),
