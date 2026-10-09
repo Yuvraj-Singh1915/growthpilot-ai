@@ -418,9 +418,14 @@ client = OpenAI(
 )
 app = FastAPI(title="GrowthPilot AI")
 
+frontend_origin = os.getenv("FRONTEND_ORIGIN", "").strip().rstrip("/")
+allowed_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+if frontend_origin:
+    allowed_origins.append(frontend_origin)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

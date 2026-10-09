@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { apiUrl } from "@/lib/api";
 
 type Opportunity = {
   title: string;
@@ -237,7 +238,7 @@ export default function Home() {
 
     try {
       const response = await fetch(
-        "http://127.0.0.1:8000/api/opportunities",
+        apiUrl("/api/opportunities"),
         {
           method: "POST",
           headers: {
@@ -277,7 +278,7 @@ export default function Home() {
     setLoadingLearning(true);
     setLearningError("");
     try {
-      const response = await fetch("http://127.0.0.1:8000/api/learning");
+      const response = await fetch(apiUrl("/api/learning"));
       if (!response.ok) {
         throw new Error("Failed to load experiment learning");
       }
@@ -300,7 +301,7 @@ export default function Home() {
     }));
     try {
       const response = await fetch(
-        "http://127.0.0.1:8000/api/autopilot/next-action",
+        apiUrl("/api/autopilot/next-action"),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -355,7 +356,7 @@ export default function Home() {
 
   try {
     // 1. AI STRATEGY
-    const response = await fetch("http://127.0.0.1:8000/api/strategy", {
+    const response = await fetch(apiUrl("/api/strategy"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -398,7 +399,7 @@ export default function Home() {
 
     // 2. CREATE EXPERIMENT
     const experimentResponse = await fetch(
-      "http://127.0.0.1:8000/api/experiment",
+      apiUrl("/api/experiment"),
       {
         method: "POST",
         headers: {
@@ -452,7 +453,7 @@ export default function Home() {
     // 3. MEASUREMENT
     // Measurement is derived from persisted assignments and commerce records.
     const measurementResponse = await fetch(
-      "http://127.0.0.1:8000/api/measurement",
+      apiUrl("/api/measurement"),
       {
         method: "POST",
         headers: {
@@ -487,7 +488,7 @@ export default function Home() {
     setLoadingEvaluation(index);
 
     const evaluationResponse = await fetch(
-      "http://127.0.0.1:8000/api/evaluate-result",
+      apiUrl("/api/evaluate-result"),
       {
         method: "POST",
         headers: {
@@ -771,7 +772,7 @@ export default function Home() {
 
               try {
                 const response = await fetch(
-                  "http://127.0.0.1:8000/api/goal",
+                  apiUrl("/api/goal"),
                   {
                     method: "POST",
                     headers: {
@@ -1642,7 +1643,7 @@ export default function Home() {
 
                     try {
                       const response = await fetch(
-                        "http://127.0.0.1:8000/api/demo/seed",
+                        apiUrl("/api/demo/seed"),
                         { method: "POST" }
                       );
 
