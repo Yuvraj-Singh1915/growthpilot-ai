@@ -497,6 +497,20 @@ class LearningLoopTests(unittest.TestCase):
         )
         orders.append(failed_order)
         payments.append(self.add_payment(failed_order, status="failed"))
+        pending_order = self.add_order(
+            customers[2].id,
+            7000,
+            now - timedelta(days=1),
+            margin=90,
+            status="pending",
+        )
+        orders.append(pending_order)
+        payments.append(self.add_payment(pending_order))
+        future_order = self.add_order(
+            customers[3].id, 9000, now + timedelta(days=1), margin=90
+        )
+        orders.append(future_order)
+        payments.append(self.add_payment(future_order))
         unassigned_order = self.add_order(
             customers[20].id, 8000, now - timedelta(days=1), margin=90
         )
@@ -541,6 +555,49 @@ class LearningLoopTests(unittest.TestCase):
             small_sample["metrics"]["sample_status"],
             "insufficient_sample",
         )
+        control_underpowered = calculate_experiment_metrics(
+            experiment,
+            assignments[1:],
+            orders,
+            payments=payments,
+            measured_at=now,
+        )
+        self.assertEqual(
+            control_underpowered["metrics"]["sample_status"],
+            "insufficient_sample",
+        )
+
+    def test_measurement_without_observed_orders_does_not_report_revenue_uplift(self):
+        started_at = datetime.utcnow() - timedelta(days=8)
+        experiment = SimpleNamespace(
+            experiment_id="EXP-NO-OBSERVED-ORDERS",
+            opportunity_title="Increase Average Order Value",
+            started_at=started_at,
+        )
+        assignments = [
+            SimpleNamespace(
+                customer_id=customer_id,
+                variant="CONTROL" if index < 10 else "TREATMENT",
+            )
+            for index, customer_id in enumerate(range(1, 21))
+        ]
+
+        result = calculate_experiment_metrics(
+            experiment,
+            assignments,
+            orders=[],
+            measured_at=started_at + timedelta(days=8),
+        )
+
+        self.assertEqual(result["metrics"]["sample_status"], "sufficient_sample")
+        self.assertEqual(result["metrics"]["control_orders"], 0)
+        self.assertEqual(result["metrics"]["treatment_orders"], 0)
+        self.assertEqual(result["metrics"]["control_revenue"], 0)
+        self.assertEqual(result["metrics"]["treatment_revenue"], 0)
+        self.assertEqual(result["incremental_revenue"], 0)
+        self.assertIsNone(result["revenue_growth_percent"])
+        self.assertIsNone(result["margin_change"])
+        self.assertIsNone(result["metrics"]["treatment_margin_percent"])
 
     def test_post_start_ingested_order_for_assigned_customer_is_measured(self):
         opportunity = self.add_opportunity("Increase Average Order Value")
@@ -634,15 +691,26 @@ class LearningLoopTests(unittest.TestCase):
             started_days_ago=2,
             treatment_margin=1,
         )
-        early_result = main.evaluate_result(
-            main.ResultEvaluationRequest(experiment_id=early.experiment_id)
-        )
+        with patch.object(
+            main,
+            "_request_ai_experiment_evaluation",
+        ) as evaluator:
+            early_result = main.evaluate_result(
+                main.ResultEvaluationRequest(experiment_id=early.experiment_id)
+            )
+            evaluator.assert_not_called()
         self.assertEqual(early_result["experiment_status"], "RUNNING")
+        early_evaluation = json.loads(early_result["evaluation"])
+        self.assertEqual(early_evaluation["decision"], "CONTINUE")
+        self.assertIn("7-day observation window is not complete", early_evaluation["reason"])
+        self.assertIsNone(early.completed_at)
         self.assertEqual(self.client_db.query(main.LearningRecord).count(), 0)
-        self.assertEqual(
-            self.client_db.query(main.ExperimentEvaluation).count(),
-            1,
+        persisted_early_evaluation = (
+            self.client_db.query(main.ExperimentEvaluation)
+            .filter_by(experiment_id=early.id)
+            .one()
         )
+        self.assertEqual(persisted_early_evaluation.decision, "CONTINUE")
 
         underpowered_opportunity = self.add_opportunity("Increase Repeat Purchases")
         underpowered = self.add_experiment_with_assignments(
@@ -684,6 +752,41 @@ class LearningLoopTests(unittest.TestCase):
             "CONTINUE",
         )
         self.assertEqual(self.client_db.query(main.LearningRecord).count(), 0)
+
+    def test_missing_treatment_margin_cannot_finalize_evaluation_or_learning(self):
+        opportunity = self.add_opportunity("Increase Average Order Value")
+        experiment = self.add_experiment_with_assignments(
+            opportunity,
+            "Recommend relevant product bundles",
+            control_count=10,
+            treatment_count=10,
+            started_days_ago=8,
+            treatment_margin=None,
+        )
+        metrics = main._get_experiment_measurement(self.client_db, experiment)
+        self.assertEqual(metrics["metrics"]["sample_status"], "sufficient_sample")
+        self.assertIsNone(metrics["metrics"]["treatment_margin_percent"])
+
+        with patch.object(
+            main,
+            "_request_ai_experiment_evaluation",
+        ) as evaluator:
+            result = main.evaluate_result(
+                main.ResultEvaluationRequest(experiment_id=experiment.experiment_id)
+            )
+            evaluator.assert_not_called()
+
+        evaluation = json.loads(result["evaluation"])
+        self.assertEqual(result["experiment_status"], "RUNNING")
+        self.assertEqual(evaluation["decision"], "CONTINUE")
+        self.assertIn("margin could not be calculated", evaluation["reason"])
+        self.assertIsNone(experiment.completed_at)
+        self.assertEqual(
+            self.client_db.query(main.LearningRecord)
+            .filter_by(experiment_id=experiment.id)
+            .count(),
+            0,
+        )
 
     def test_real_evaluation_helper_persists_final_evaluation_and_learning(self):
         opportunity = self.add_opportunity("Increase Average Order Value")
@@ -1250,6 +1353,44 @@ class LearningLoopTests(unittest.TestCase):
             ("POST", "/api/autopilot/next-action"),
         }
         self.assertTrue(expected <= routes)
+
+    def test_experiment_and_measurement_apis_expose_dashboard_lifecycle_fields(self):
+        opportunity = self.add_opportunity("Increase Average Order Value")
+        experiment = self.add_experiment_with_assignments(
+            opportunity,
+            "Recommend relevant product bundles",
+            control_count=18,
+            treatment_count=2,
+            started_days_ago=2,
+            treatment_margin=None,
+        )
+
+        experiment_data = main.get_experiment(experiment.experiment_id)
+        measurement_data = main.calculate_measurement(
+            main.MeasurementRequest(experiment_id=experiment.experiment_id)
+        )
+
+        self.assertEqual(experiment_data["status"], "RUNNING")
+        self.assertEqual(experiment_data["experiment_status"], "RUNNING")
+        self.assertEqual(
+            experiment_data["assigned_customers"],
+            {"control": 18, "treatment": 2, "total": 20},
+        )
+        self.assertEqual(experiment_data["started_at"], experiment.started_at.isoformat())
+        self.assertIsNone(experiment_data["completed_at"])
+        self.assertEqual(
+            measurement_data["metrics"]["sample_status"],
+            "insufficient_observation_window",
+        )
+        self.assertEqual(measurement_data["metrics"]["control_customers"], 18)
+        self.assertEqual(measurement_data["metrics"]["treatment_customers"], 2)
+        self.assertEqual(measurement_data["metrics"]["minimum_observation_days"], 7)
+        self.assertGreaterEqual(measurement_data["metrics"]["observation_days"], 1.99)
+        self.assertIn(
+            "the 7-day observation window is not complete",
+            measurement_data["metrics"]["sample_issues"],
+        )
+        self.assertIsNone(measurement_data["metrics"]["treatment_margin_percent"])
 
 
 if __name__ == "__main__":

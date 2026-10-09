@@ -50,6 +50,7 @@ type ExperimentResult = {
   };
   started_at?: string;
   measurement_status?: string;
+  completed_at?: string | null;
 };
 
 type MeasurementResult = {
@@ -66,11 +67,47 @@ type MeasurementResult = {
     treatment_conversions?: number;
     control_orders?: number;
     treatment_orders?: number;
+    control_margin_percent?: number | null;
+    treatment_margin_percent?: number | null;
     control_average_order_value?: number | null;
     treatment_average_order_value?: number | null;
     sample_issues?: string[];
+    observation_days?: number;
+    minimum_observation_days?: number;
   };
 };
+
+type ObservationProgress = {
+  observationDays: number;
+  minimumDays: number;
+  percentComplete: number | null;
+};
+
+function getObservationProgress(
+  metrics?: MeasurementResult["metrics"]
+): ObservationProgress | null {
+  const observationDays = metrics?.observation_days;
+  const minimumDays = metrics?.minimum_observation_days;
+  if (
+    typeof observationDays !== "number" ||
+    !Number.isFinite(observationDays) ||
+    observationDays < 0 ||
+    typeof minimumDays !== "number" ||
+    !Number.isFinite(minimumDays) ||
+    minimumDays < 0
+  ) {
+    return null;
+  }
+
+  return {
+    observationDays,
+    minimumDays,
+    percentComplete:
+      minimumDays > 0
+        ? Math.min(100, (observationDays / minimumDays) * 100)
+        : null,
+  };
+}
 
 type LearningRecord = {
   experiment_id: string;
@@ -183,6 +220,10 @@ function formatMeasurementStatus(status?: string) {
   }
 }
 
+function formatObservedMargin(margin?: number | null) {
+  return margin == null ? "Unavailable" : `${margin}%`;
+}
+
 export default function Home() {
   const [goal, setGoal] = useState(15);
   const [maxDiscount, setMaxDiscount] = useState(10);
@@ -214,6 +255,15 @@ export default function Home() {
 
   const [measurementResults, setMeasurementResults] = useState<
     Record<number, MeasurementResult>
+  >({});
+  const [refreshingExperiment, setRefreshingExperiment] = useState<
+    Record<number, boolean>
+  >({});
+  const [experimentRefreshErrors, setExperimentRefreshErrors] = useState<
+    Record<number, string>
+  >({});
+  const [staleMeasurementResults, setStaleMeasurementResults] = useState<
+    Record<number, boolean>
   >({});
 
   const [loadingDecision, setLoadingDecision] = useState<number | null>(null);
@@ -338,6 +388,80 @@ export default function Home() {
       }));
     } finally {
       setLoadingNextAction(null);
+    }
+  };
+
+  const refreshExperiment = async (index: number) => {
+    const experimentId = experimentResults[index]?.experiment_id;
+    if (!experimentId) {
+      return;
+    }
+
+    setRefreshingExperiment((previous) => ({ ...previous, [index]: true }));
+    setExperimentRefreshErrors((previous) => ({ ...previous, [index]: "" }));
+    setStaleMeasurementResults((previous) => ({
+      ...previous,
+      [index]: !!measurementResults[index],
+    }));
+
+    try {
+      const experimentResponse = await fetch(
+        apiUrl(`/api/experiment/${encodeURIComponent(experimentId)}`)
+      );
+      if (!experimentResponse.ok) {
+        throw new Error(
+          await getApiErrorMessage(
+            experimentResponse,
+            "Failed to refresh experiment status."
+          )
+        );
+      }
+      const experimentData: ExperimentResult = await experimentResponse.json();
+      setExperimentResults((previous) => ({
+        ...previous,
+        [index]: {
+          ...previous[index],
+          ...experimentData,
+          experiment_status:
+            experimentData.experiment_status ?? experimentData.status,
+        },
+      }));
+
+      const measurementResponse = await fetch(apiUrl("/api/measurement"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ experiment_id: experimentId }),
+      });
+      if (!measurementResponse.ok) {
+        throw new Error(
+          await getApiErrorMessage(
+            measurementResponse,
+            "Failed to refresh experiment measurement."
+          )
+        );
+      }
+      const measurementData: MeasurementResult =
+        await measurementResponse.json();
+
+      setMeasurementResults((previous) => ({
+        ...previous,
+        [index]: measurementData,
+      }));
+      setStaleMeasurementResults((previous) => ({
+        ...previous,
+        [index]: false,
+      }));
+    } catch (error) {
+      console.error("Experiment refresh error:", error);
+      setExperimentRefreshErrors((previous) => ({
+        ...previous,
+        [index]:
+          error instanceof Error
+            ? error.message
+            : "Could not refresh experiment data.",
+      }));
+    } finally {
+      setRefreshingExperiment((previous) => ({ ...previous, [index]: false }));
     }
   };
 
@@ -572,12 +696,18 @@ export default function Home() {
       ? measurementResults[lastMeasurementIndex]
       : null;
 
+  const lastMeasurementIsStale =
+    lastMeasurementIndex !== null &&
+    !!staleMeasurementResults[lastMeasurementIndex];
   const isWaitingForObservation =
     !lastMeasurement ||
+    lastMeasurementIsStale ||
     lastMeasurement.metrics?.sample_status ===
       "insufficient_observation_window";
   const waitingForObservationCopy =
-    "No observed results yet. GrowthPilot evaluates the experiment only after the observation window is complete.";
+    lastMeasurementIsStale
+      ? "The latest measurement refresh failed. Previously observed values are marked stale until refreshed."
+      : "No observed results yet. GrowthPilot evaluates the experiment only after the observation window is complete.";
   const observedRevenueValue =
     !isWaitingForObservation && lastMeasurement?.incremental_revenue != null
       ? `₹${lastMeasurement.incremental_revenue.toLocaleString("en-IN")}`
@@ -1382,14 +1512,38 @@ export default function Home() {
                           ] && (
                             <div className="mt-4 min-w-0 rounded-lg border border-green-500/20 bg-green-500/5 p-4">
 
-                              <p className="text-sm font-semibold text-green-400">
-                                Experiment
-                              </p>
+                              <div className="flex flex-wrap items-center justify-between gap-3">
+                                <p className="text-sm font-semibold text-green-400">
+                                  Experiment
+                                </p>
+                                <button
+                                  type="button"
+                                  onClick={() => void refreshExperiment(index)}
+                                  disabled={refreshingExperiment[index]}
+                                  className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                  {refreshingExperiment[index]
+                                    ? "Refreshing..."
+                                    : "Refresh status & measurement"}
+                                </button>
+                              </div>
+                              {experimentRefreshErrors[index] && (
+                                <p className="mt-2 text-xs text-amber-300" role="alert">
+                                  {experimentRefreshErrors[index]}
+                                </p>
+                              )}
 
                               <div className="mt-2 flex flex-wrap gap-2">
-                                <span className="rounded-full bg-emerald-500/10 px-3 py-1 text-xs font-semibold text-emerald-300">
+                                <span
+                                  className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                                    experimentResults[index].experiment_status ===
+                                    "RUNNING"
+                                      ? "bg-emerald-500/10 text-emerald-300"
+                                      : "bg-slate-500/10 text-slate-300"
+                                  }`}
+                                >
                                   {experimentResults[index].experiment_status ||
-                                    "Launched"}
+                                    "Status unavailable"}
                                 </span>
                                 {measurementResults[index] && (
                                   <span className="rounded-full bg-cyan-500/10 px-3 py-1 text-xs font-semibold text-cyan-200">
@@ -1434,11 +1588,18 @@ export default function Home() {
                                   <p className="text-slate-500">
                                     Status
                                   </p>
-                                  <p className="break-words font-semibold text-green-400">
+                                  <p
+                                    className={`break-words font-semibold ${
+                                      experimentResults[index]
+                                        .experiment_status === "RUNNING"
+                                        ? "text-green-400"
+                                        : "text-slate-300"
+                                    }`}
+                                  >
                                     {
                                       experimentResults[index]
                                         .experiment_status ||
-                                      experimentResults[index].status
+                                      "Unavailable"
                                     }
                                   </p>
                                 </div>
@@ -1463,10 +1624,10 @@ export default function Home() {
                                   </p>
                                   <p className="break-words font-semibold">
                                     {experimentResults[index]
-                                      .assigned_customers?.treatment ?? 0}{" "}
+                                      .assigned_customers?.treatment ?? "Unavailable"}{" "}
                                     treatment /{" "}
                                     {experimentResults[index]
-                                      .assigned_customers?.control ?? 0}{" "}
+                                      .assigned_customers?.control ?? "Unavailable"}{" "}
                                     control
                                   </p>
                                 </div>
@@ -1491,6 +1652,18 @@ export default function Home() {
                                     <p className="break-words font-semibold">
                                       {new Date(
                                         experimentResults[index].started_at!
+                                      ).toLocaleString()}
+                                    </p>
+                                  </div>
+                                )}
+                                {experimentResults[index].completed_at && (
+                                  <div className="min-w-0">
+                                    <p className="text-slate-500">
+                                      Completed
+                                    </p>
+                                    <p className="break-words font-semibold">
+                                      {new Date(
+                                        experimentResults[index].completed_at
                                       ).toLocaleString()}
                                     </p>
                                   </div>
@@ -1520,6 +1693,11 @@ export default function Home() {
                                     <p className="text-sm font-semibold text-blue-300">
                                     Measurement
                                     </p>
+                                    {staleMeasurementResults[index] && (
+                                      <span className="rounded-full bg-amber-500/10 px-3 py-1 text-xs font-semibold text-amber-300">
+                                        Previous measurement · refresh failed
+                                      </span>
+                                    )}
                                     {measurementResults[index].metrics?.sample_status ===
                                       "insufficient_observation_window" && (
                                       <span className="rounded-full bg-amber-500/10 px-3 py-1 text-xs font-semibold text-amber-300">
@@ -1527,6 +1705,102 @@ export default function Home() {
                                       </span>
                                     )}
                                   </div>
+                                  {(() => {
+                                    const progress = getObservationProgress(
+                                      measurementResults[index].metrics
+                                    );
+                                    if (!progress) {
+                                      return (
+                                        <p className="mt-3 text-xs text-amber-300">
+                                          Observation progress unavailable.
+                                        </p>
+                                      );
+                                    }
+
+                                    return (
+                                      <div className="mt-3">
+                                        <div className="flex flex-wrap justify-between gap-2 text-xs text-slate-400">
+                                          <span>Observation window elapsed</span>
+                                          <span>
+                                            {progress.observationDays.toFixed(2)}{" "}
+                                            days elapsed
+                                            {progress.minimumDays > 0
+                                              ? ` / ${progress.minimumDays} days`
+                                              : " · no minimum duration configured"}
+                                          </span>
+                                        </div>
+                                        {progress.percentComplete !== null && (
+                                          <div
+                                            className="mt-2 h-2 overflow-hidden rounded-full bg-slate-800"
+                                            role="progressbar"
+                                            aria-label="Observation window progress"
+                                            aria-valuemin={0}
+                                            aria-valuemax={100}
+                                            aria-valuenow={progress.percentComplete}
+                                          >
+                                            <div
+                                              className="h-full rounded-full bg-cyan-400"
+                                              style={{
+                                                width: `${progress.percentComplete}%`,
+                                              }}
+                                            />
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })()}
+                                  {measurementResults[index].metrics && (
+                                    <div className="mt-3 space-y-1 text-xs text-slate-400">
+                                      <p>
+                                        Observed orders:{" "}
+                                        {measurementResults[index].metrics
+                                          ?.control_orders ?? "Unavailable"}{" "}
+                                        control /{" "}
+                                        {measurementResults[index].metrics
+                                          ?.treatment_orders ?? "Unavailable"}{" "}
+                                        treatment
+                                      </p>
+                                      <p>
+                                        Observed margin: control{" "}
+                                        {formatObservedMargin(
+                                          measurementResults[index].metrics
+                                            ?.control_margin_percent
+                                        )}{" "}
+                                        / treatment{" "}
+                                        {formatObservedMargin(
+                                          measurementResults[index].metrics
+                                            ?.treatment_margin_percent
+                                        )}
+                                      </p>
+                                      {measurementResults[index].metrics
+                                        ?.sample_issues &&
+                                        measurementResults[index].metrics
+                                          .sample_issues!.length > 0 && (
+                                          <p className="text-amber-300">
+                                            Measurement evidence needed:{" "}
+                                            {measurementResults[
+                                              index
+                                            ].metrics!.sample_issues!.join("; ")}.
+                                          </p>
+                                        )}
+                                      {measurementResults[index].metrics
+                                        ?.control_orders === 0 &&
+                                        measurementResults[index].metrics
+                                          ?.treatment_orders === 0 && (
+                                          <p className="text-amber-300">
+                                            No qualifying completed orders have
+                                            been observed in either arm.
+                                          </p>
+                                        )}
+                                      {measurementResults[index].metrics
+                                        ?.treatment_margin_percent == null && (
+                                        <p className="text-amber-300">
+                                          Treatment margin evidence is
+                                          unavailable from observed orders.
+                                        </p>
+                                      )}
+                                    </div>
+                                  )}
                                   {measurementResults[index].metrics?.sample_status ===
                                     "insufficient_observation_window" && (
                                     <p className="mt-2 text-sm text-slate-400">
