@@ -666,6 +666,14 @@ def seed_demo_commerce_data(db):
 
 
 def extend_demo_commerce_data(db, target_eligible_customers=120):
+    connection = db.connection()
+    if connection.dialect.name != "sqlite":
+        raise HTTPException(
+            status_code=503,
+            detail="Safe demo data extension is supported only with SQLite.",
+        )
+    connection.exec_driver_sql("BEGIN IMMEDIATE")
+
     def eligible_aov_customers():
         customer_ids, orders, payments = _commerce_intelligence_inputs(db)
         return get_eligible_customers(
@@ -721,9 +729,8 @@ def extend_demo_commerce_data(db, target_eligible_customers=120):
         for order in orders
     )
     db.add_all(payments)
-    db.commit()
-
     eligible_count = len(eligible_aov_customers())
+    db.commit()
     return {
         "status": "success",
         "customers_created": len(customers),
@@ -754,6 +761,22 @@ def seed_demo_data():
 
 @app.post("/api/demo/seed/extend")
 def extend_demo_data():
+    production_mode = os.getenv("RENDER", "").strip().lower() == "true" or any(
+        os.getenv(name, "").strip().lower() in {"prod", "production"}
+        for name in ("GROWTHPILOT_ENV", "APP_ENV", "ENVIRONMENT")
+    )
+    extension_enabled = os.getenv(
+        "DEMO_DATA_EXTENSION_ENABLED", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if production_mode or not extension_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Demo data extension is disabled. Enable "
+                "DEMO_DATA_EXTENSION_ENABLED only in a development/demo environment."
+            ),
+        )
+
     db = SessionLocal()
     try:
         return extend_demo_commerce_data(db)

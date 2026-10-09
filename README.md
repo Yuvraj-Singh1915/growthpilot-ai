@@ -70,7 +70,7 @@ Experiment outcomes are calculated from completed orders recorded for assigned c
 - The backend suite currently has **44 passing tests**, including an isolated deterministic Razorpay E2E test for signed webhook ingestion through order mapping, opportunity detection, strategy/guardrails, experiment, measurement, and evaluation persistence. External Razorpay and Gemini calls are not made.
 - A separate regression test exercises the real evaluation helper and verifies persisted evaluation and learning state while mocking only the Gemini response.
 - Experiment launch requires at least 10 customers in each arm of the planned 90/10 assignment; the current allocator needs at least 96 eligible customers.
-- To extend local demo data for an AOV experiment, call `POST /api/demo/seed/extend`. It adds linked demo customers, completed orders, successful payments, and cart events until at least 120 customers qualify. Repeated calls are idempotent and do not alter existing experiment history. This is a local demo-data helper, not a production ingestion mechanism. The original `POST /api/demo/seed` behavior is unchanged.
+- To extend local demo data for an AOV experiment, explicitly set `DEMO_DATA_EXTENSION_ENABLED=true` in a development/demo environment, then call `POST /api/demo/seed/extend`. The endpoint refuses requests in production (including Render) regardless of this setting. It adds linked demo customers, completed orders, successful payments, and cart events until at least 120 customers qualify. Concurrent and repeated calls are serialized and do not overshoot the eligible-customer target or alter existing experiment history. This is a local demo-data helper, not a production ingestion mechanism. The original `POST /api/demo/seed` behavior is unchanged.
 
 ## Razorpay Test-Mode Integration
 
@@ -184,11 +184,12 @@ curl.exe -X POST http://127.0.0.1:8000/api/demo/seed
 
 If existing commerce data does not provide enough eligible AOV customers for an experiment, extend local demo data with:
 
-```bash
+```powershell
+$env:DEMO_DATA_EXTENSION_ENABLED = "true"
 curl.exe -X POST http://127.0.0.1:8000/api/demo/seed/extend
 ```
 
-The extension endpoint is idempotent and preserves existing commerce records and experiment history. Neither seed endpoint is a production data-ingestion mechanism.
+The extension endpoint safely serializes concurrent calls and preserves existing commerce records and experiment history. Neither seed endpoint is a production data-ingestion mechanism.
 
 ### Frontend
 

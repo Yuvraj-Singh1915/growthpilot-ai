@@ -1,7 +1,10 @@
 import json
 import os
 import sys
+import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +14,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 os.environ["GROWTHPILOT_DATABASE_URL"] = "sqlite://"
 os.environ["GEMINI_API_KEY"] = "isolated-test-key"
@@ -988,6 +992,119 @@ class LearningLoopTests(unittest.TestCase):
         )
         self.assertEqual(len(detected["opportunities"]), 5)
 
+    def test_demo_extension_endpoint_is_blocked_in_production_even_when_enabled(self):
+        with patch.dict(
+            os.environ,
+            {
+                "APP_ENV": "development",
+                "RENDER": "true",
+                "DEMO_DATA_EXTENSION_ENABLED": "true",
+            },
+        ):
+            response = TestClient(main.app).post("/api/demo/seed/extend")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.client_db.query(main.Customer).count(), 0)
+        self.assertEqual(self.client_db.query(main.Order).count(), 0)
+        self.assertEqual(self.client_db.query(main.CartEvent).count(), 0)
+        self.assertEqual(self.client_db.query(main.Payment).count(), 0)
+
+    def test_demo_extension_endpoint_requires_explicit_nonproduction_opt_in(self):
+        with patch.dict(
+            os.environ,
+            {
+                "APP_ENV": "development",
+                "RENDER": "false",
+                "DEMO_DATA_EXTENSION_ENABLED": "true",
+            },
+        ):
+            response = TestClient(main.app).post("/api/demo/seed/extend")
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["eligible_customers"], 120)
+        self.assertGreater(result["customers_created"], 0)
+
+    def test_concurrent_demo_extensions_do_not_overshoot_eligible_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "demo-extension.db"
+            concurrent_engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                connect_args={"check_same_thread": False, "timeout": 15},
+            )
+            main.Base.metadata.create_all(bind=concurrent_engine)
+            previous_session_factory = main.SessionLocal
+            main.SessionLocal = sessionmaker(
+                autocommit=False,
+                autoflush=False,
+                bind=concurrent_engine,
+            )
+            setup_db = main.SessionLocal()
+            try:
+                main.seed_demo_commerce_data(setup_db)
+                initial_customers, initial_orders, initial_payments = (
+                    main._commerce_intelligence_inputs(setup_db)
+                )
+                initial_eligible_count = len(
+                    get_eligible_customers(
+                        "Increase Average Order Value",
+                        initial_customers,
+                        initial_orders,
+                        [],
+                        initial_payments,
+                    )
+                )
+                self.assertEqual(initial_eligible_count, 40)
+
+                barrier = threading.Barrier(2)
+
+                def extend_at_the_same_time():
+                    barrier.wait(timeout=5)
+                    return main.extend_demo_data()
+
+                with patch.dict(
+                    os.environ,
+                    {
+                        "APP_ENV": "development",
+                        "RENDER": "false",
+                        "DEMO_DATA_EXTENSION_ENABLED": "true",
+                    },
+                ):
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        results = list(
+                            executor.map(
+                                lambda _: extend_at_the_same_time(),
+                                range(2),
+                            )
+                        )
+
+                final_customers, final_orders, final_payments = (
+                    main._commerce_intelligence_inputs(setup_db)
+                )
+                final_eligible_count = len(
+                    get_eligible_customers(
+                        "Increase Average Order Value",
+                        final_customers,
+                        final_orders,
+                        [],
+                        final_payments,
+                    )
+                )
+                self.assertEqual(final_eligible_count, 120)
+                self.assertEqual(
+                    sum(result["customers_created"] for result in results),
+                    120 - initial_eligible_count,
+                )
+                self.assertEqual(
+                    sorted(result["eligible_customers"] for result in results),
+                    [120, 120],
+                )
+            finally:
+                setup_db.close()
+                main.SessionLocal = previous_session_factory
+                concurrent_engine.dispose()
+
     def test_demo_extension_is_idempotent_preserves_history_and_enables_launch(self):
         seeded = main.seed_demo_data()
         self.assertEqual(seeded["customers_created"], 60)
@@ -1048,7 +1165,15 @@ class LearningLoopTests(unittest.TestCase):
             )
         }
 
-        first = main.extend_demo_data()
+        with patch.dict(
+            os.environ,
+            {
+                "APP_ENV": "development",
+                "RENDER": "false",
+                "DEMO_DATA_EXTENSION_ENABLED": "true",
+            },
+        ):
+            first = main.extend_demo_data()
         self.assertGreater(first["customers_created"], 0)
         self.assertGreaterEqual(first["eligible_customers"], 120)
         self.assertEqual(first["customers_created"], first["orders_created"])
@@ -1086,7 +1211,15 @@ class LearningLoopTests(unittest.TestCase):
         self.assertGreaterEqual(launched["assigned_customers"]["treatment"], 10)
         self.assertGreaterEqual(len(eligible_ids), 120)
 
-        second = main.extend_demo_data()
+        with patch.dict(
+            os.environ,
+            {
+                "APP_ENV": "development",
+                "RENDER": "false",
+                "DEMO_DATA_EXTENSION_ENABLED": "true",
+            },
+        ):
+            second = main.extend_demo_data()
         self.assertEqual(second["customers_created"], 0)
         self.assertEqual(second["orders_created"], 0)
         self.assertEqual(second["carts_created"], 0)
