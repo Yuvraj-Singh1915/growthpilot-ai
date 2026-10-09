@@ -204,6 +204,9 @@ export default function Home() {
     Record<number, DecisionResult>
   >({});
   const [decisionErrors, setDecisionErrors] = useState<Record<number, string>>({});
+  const [experimentLaunchErrors, setExperimentLaunchErrors] = useState<
+    Record<number, string>
+  >({});
 
   const [experimentResults, setExperimentResults] = useState<
     Record<number, ExperimentResult>
@@ -352,6 +355,10 @@ export default function Home() {
     ...previous,
     [index]: "",
   }));
+  setExperimentLaunchErrors((previous) => ({
+    ...previous,
+    [index]: "",
+  }));
   setLoadingDecision(index);
 
   try {
@@ -419,17 +426,24 @@ export default function Home() {
     );
 
     if (!experimentResponse.ok) {
-      throw new Error(
-        await getApiErrorMessage(
-          experimentResponse,
-          "Experiment launch failed."
-        )
+      const message = await getApiErrorMessage(
+        experimentResponse,
+        "Experiment launch failed."
       );
+      setExperimentLaunchErrors((previous) => ({
+        ...previous,
+        [index]: message,
+      }));
+      throw new Error(message);
     }
 
     const experimentData = await experimentResponse.json();
 
     if (experimentData.status !== "launched") {
+      setExperimentLaunchErrors((previous) => ({
+        ...previous,
+        [index]: experimentData.message || "Experiment was not launched.",
+      }));
       return;
     }
 
@@ -1751,14 +1765,21 @@ export default function Home() {
               <Status
                 title="Experiment"
                 text={
-                  experimentResults[0]
+                  experimentLaunchErrors[0]
+                    ? `Not launched: ${experimentLaunchErrors[0]}`
+                    : experimentResults[0]
                     ? `Experiment ${experimentResults[0].experiment_status || "launched"}`
                     : "Waiting for approved strategy"
                 }
-                done={["COMPLETED", "STOPPED"].includes(
-                  experimentResults[0]?.experiment_status || ""
-                )}
+                done={
+                  !experimentLaunchErrors[0] &&
+                  ["COMPLETED", "STOPPED"].includes(
+                    experimentResults[0]?.experiment_status || ""
+                  )
+                }
+                warning={!!experimentLaunchErrors[0]}
                 active={
+                  !experimentLaunchErrors[0] &&
                   !!experimentResults[0] &&
                   !["COMPLETED", "STOPPED"].includes(
                     experimentResults[0].experiment_status || ""
